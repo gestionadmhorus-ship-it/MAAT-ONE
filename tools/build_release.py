@@ -50,10 +50,16 @@ FORBIDDEN_SUFFIXES = frozenset(
         ".zip",
     }
 )
-PERSONAL_MARKERS = (
-    "c:\\users\\adelio",
-    "c:\\python314",
-    "c:\\users\\adelio\\apk_maat",
+NON_PORTABLE_PATH_PATTERNS = (
+    re.compile(
+        r"(?i)(?<![a-z0-9_])[a-z]:[\\/]+"
+        r"(?![^\s\"']*<[^>\r\n]+>)(?=[^\\/\s\"'<>|])"
+    ),
+    re.compile(
+        r"(?i)(?<![a-z0-9_.:\\/])(?:[\\/]{2,})"
+        r"(?![^\s\"']*<[^>\r\n]+>)"
+        r"[^\\/\s\"'<>|]+[\\/]+[^\\/\s\"'<>|]+"
+    ),
 )
 FIXED_ZIP_TIMESTAMP = (2026, 1, 1, 0, 0, 0)
 
@@ -123,12 +129,12 @@ def _validate_sources(files: list[tuple[Path, str]]) -> None:
                     f"Sintaxis Python no válida: {archive_name}"
                 ) from error
         try:
-            text = content.decode("utf-8").casefold()
+            text = content.decode("utf-8")
         except UnicodeDecodeError:
             continue
-        if any(marker in text for marker in PERSONAL_MARKERS):
+        if any(pattern.search(text) for pattern in NON_PORTABLE_PATH_PATTERNS):
             raise ReleaseBuildError(
-                f"Se encontró una ruta personal en: {archive_name}"
+                f"Se encontró una ruta absoluta no portable en: {archive_name}"
             )
 
 
