@@ -143,13 +143,18 @@ from src.ui.main_window import MainWindow
 from src.geographic_search import find_images_by_name
 from src.geographic_selection import GeographicSelection
 from src.geographic_export import export_geographic_selection
+from src.update_service import migrate_flat_installation, read_current_state
 
 root = Path.cwd()
 data = json.loads((root / "version.json").read_text(encoding="utf-8"))
 version = data.get("version")
 if not isinstance(version, str) or re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", version) is None:
     raise RuntimeError("version.json no contiene una versión SemVer válida")
-print(version)
+active_root = migrate_flat_installation(root)
+state = read_current_state(root)
+if state["active_version"] != version or active_root.name != version:
+    raise RuntimeError("La estructura versionada inicial no es coherente")
+print(state["active_version"])
 '@
     Push-Location $installRoot
     try {

@@ -9,7 +9,14 @@ import tkinter as tk
 from tkinter import messagebox
 from typing import Callable
 
-from src.update_service import process_updates_silently
+from src.update_service import (
+    migrate_flat_installation,
+    process_updates_silently,
+    read_current_state,
+    record_executed_version,
+    resolve_active_release,
+    rollback_release,
+)
 
 
 PythonCommand = list[str]
@@ -127,24 +134,66 @@ def run_loading_task(task: Callable[[], object]) -> object:
     return LoadingWindow().run(task)
 
 
+def _validation_python(
+    root: Path,
+    finder: ExecutableFinder,
+) -> PythonCommand | None:
+    local_python = root / ".venv" / "Scripts" / "python.exe"
+    if local_python.is_file():
+        return [str(local_python)]
+    for executable, arguments in (("py.exe", ["-3"]), ("python.exe", [])):
+        resolved = finder(executable)
+        if resolved:
+            return [resolved, *arguments]
+    return None
+
+
+def _smoke_test_release(
+    release_root: Path,
+    python_command: PythonCommand | None,
+) -> bool:
+    if python_command is None:
+        return False
+    validation = (
+        "from pathlib import Path; "
+        "files=[Path('app.py'),*Path('src').rglob('*.py')]; "
+        "[compile(p.read_bytes(),str(p),'exec') for p in files]; "
+        "import json,tkinter,PIL,openpyxl,python_calamine,app; "
+        "from src.ui.main_window import MainWindow; "
+        "json.loads(Path('version.json').read_text(encoding='utf-8'))"
+    )
+    try:
+        completed = subprocess.run(
+            [*python_command, "-c", validation],
+            cwd=release_root,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _application_survived_start(process: subprocess.Popen) -> bool:
+    try:
+        process.wait(timeout=1.5)
+    except subprocess.TimeoutExpired:
+        return True
+    return False
+
+
 def launch(
     root: Path | None = None,
     finder: ExecutableFinder = shutil.which,
     error_handler: Callable[[str], None] = show_error,
-    update_processor: Callable[[Path], dict[str, object]] = (
+    update_processor: Callable[..., dict[str, object]] = (
         process_updates_silently
     ),
     loading_runner: Callable[[Callable[[], object]], object] = run_loading_task,
 ) -> bool:
     """Inicia app.py con el intérprete disponible y la raíz como directorio."""
     install_root = (root or installation_root()).resolve()
-    application = install_root / "app.py"
-    if not application.is_file():
-        error_handler(
-            "No se encontró app.py en la carpeta de instalación de MAAT One."
-        )
-        return False
-
     python_command = resolve_python(install_root, finder)
     if python_command is None:
         error_handler(
@@ -153,21 +202,69 @@ def launch(
         )
         return False
 
+    validation_python = _validation_python(install_root, finder)
+
+    def prepare_and_check() -> dict[str, object]:
+        active_root = migrate_flat_installation(install_root)
+        state = read_current_state(install_root)
+        result = update_processor(
+            install_root,
+            smoke_test=lambda release_root: _smoke_test_release(
+                release_root, validation_python
+            ),
+        )
+        return {
+            "initial_active": state["active_version"],
+            "active_root": str(active_root),
+            "update": result,
+        }
+
     try:
-        loading_runner(lambda: update_processor(install_root))
+        loading_runner(prepare_and_check)
     except Exception:
         pass
 
     try:
-        subprocess.Popen(
+        application_root = resolve_active_release(install_root)
+        active_state = read_current_state(install_root)
+    except Exception:
+        error_handler(
+            "No fue posible determinar una versión válida de MAAT One."
+        )
+        return False
+    application = application_root / "app.py"
+
+    try:
+        process = subprocess.Popen(
             [*python_command, str(application)],
-            cwd=install_root,
+            cwd=application_root,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except OSError:
         error_handler(
             "No fue posible iniciar MAAT One con el intérprete de Python encontrado."
         )
+        return False
+    if _application_survived_start(process):
+        record_executed_version(
+            install_root, str(active_state["active_version"])
+        )
+        return True
+
+    try:
+        loading_runner(lambda: rollback_release(install_root))
+        application_root = resolve_active_release(install_root)
+        active_state = read_current_state(install_root)
+        subprocess.Popen(
+            [*python_command, str(application_root / "app.py")],
+            cwd=application_root,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        record_executed_version(
+            install_root, str(active_state["active_version"])
+        )
+    except Exception:
+        error_handler("No fue posible iniciar una versión válida de MAAT One.")
         return False
     return True
 
