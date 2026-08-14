@@ -2,15 +2,28 @@
 
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageOps, ImageTk
 
 from src.dji_parser import parse_dji_images
 from src.excel_traceability import TraceabilityError, generate_traceability_excel
 from src.excel_reader import read_project_excel
+from src.geographic_export import (
+    GeographicExportError,
+    export_geographic_selection,
+)
+from src.geographic_search import (
+    GeographicSearchError,
+    find_nearest_gps_image,
+    find_images_by_name,
+    search_by_coordinates,
+    search_by_reference_image,
+    validate_coordinate_input,
+)
+from src.geographic_selection import GeographicSelection
 from src.gps_metadata import GPSMetadataCache
-from src.image_inventory import inventory_project_images
+from src.image_inventory import build_image_inventory, inventory_project_images
 from src.output_copier import copy_planned_images
 from src.output_planner import build_output_plan
 from src.set_builder import build_sets
@@ -271,6 +284,16 @@ class MainWindow:
         self._alternative_click_job: str | None = None
         self._review_preview_rendering = False
         self._review_preview_transitioning = False
+        self._geographic_view_built = False
+        self._geographic_root: Path | None = None
+        self._geographic_images: list[dict[str, str]] = []
+        self._geographic_gps_metadata = GPSMetadataCache()
+        self._geographic_name_matches: list[dict[str, str]] = []
+        self._geographic_reference: dict[str, str] | None = None
+        self._geographic_selection = GeographicSelection()
+        self._geographic_preview_photo: ImageTk.PhotoImage | None = None
+        self._geographic_preview_rendering = False
+        self._geographic_without_gps_count = 0
 
         self._configure_styles()
         self._build_interface()
@@ -396,6 +419,18 @@ class MainWindow:
                 foreground=palette["muted"],
                 insertbackground=palette["text"],
             )
+        if hasattr(self, "_geographic_matches_text"):
+            self._geographic_matches_text.configure(
+                background=palette["field"],
+                foreground=palette["text"],
+                highlightbackground=palette["border"],
+                highlightcolor=palette["accent"],
+            )
+            self._geographic_matches_text.tag_configure(
+                "Selected.Reference",
+                background=palette["selection"],
+                foreground=palette["selection_text"],
+            )
         for name in ("set_list", "review_list"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -418,16 +453,45 @@ class MainWindow:
         self.theme_button.configure(text="Claro" if self.dark_mode else "Oscuro")
 
     def _build_interface(self) -> None:
-        content = ttk.Frame(self.root, style="App.TFrame", padding=(24, 14))
-        content.pack(fill="both", expand=True)
+        shell = ttk.Frame(self.root, style="App.TFrame")
+        shell.pack(fill="both", expand=True)
+
+        view_selector = ttk.Frame(shell, style="App.TFrame", padding=(24, 10))
+        view_selector.pack(fill="x")
+        self.processing_view_button = ttk.Button(
+            view_selector,
+            text="Procesar proyecto",
+            command=self._show_processing_view,
+        )
+        self.processing_view_button.pack(side="left")
+        self.geographic_search_button = ttk.Button(
+            view_selector,
+            text="Buscar por ubicación",
+            command=self._open_geographic_search,
+        )
+        self.geographic_search_button.pack(side="left", padx=(8, 0))
 
         self.theme_button = ttk.Button(
-            content,
+            view_selector,
             text="Oscuro",
             command=self._toggle_theme,
             style="Theme.TButton",
         )
-        self.theme_button.place(relx=1.0, x=0, y=0, anchor="ne")
+        self.theme_button.pack(side="right")
+
+        self._view_host = ttk.Frame(shell, style="App.TFrame")
+        self._view_host.pack(fill="both", expand=True)
+        self._processing_view = ttk.Frame(
+            self._view_host,
+            style="App.TFrame",
+            padding=(24, 4, 24, 14),
+        )
+        self._processing_view.pack(fill="both", expand=True)
+        self._geographic_view = ttk.Frame(
+            self._view_host,
+            style="App.TFrame",
+        )
+        content = self._processing_view
 
         ttk.Label(content, text="MAAT One", style="Title.TLabel").pack()
         ttk.Label(
@@ -1667,6 +1731,802 @@ class MainWindow:
         dialog.grab_set()
         dialog.wait_window()
 
+    def _show_processing_view(self) -> None:
+        self._geographic_view.pack_forget()
+        self._processing_view.pack(fill="both", expand=True)
+
+    def _open_geographic_search(self) -> None:
+        self._processing_view.pack_forget()
+        self._geographic_view.pack(fill="both", expand=True)
+        if self._geographic_view_built:
+            return
+        self._geographic_view_built = True
+
+        self._geographic_query = tk.StringVar()
+        self._geographic_latitude = tk.StringVar()
+        self._geographic_longitude = tk.StringVar()
+        self._geographic_radius = tk.StringVar(value="10")
+        self._geographic_channels = {
+            channel: tk.BooleanVar(value=True)
+            for channel in ("Z", "W", "T")
+        }
+        self._geographic_reference_text = tk.StringVar(
+            value="Busque y seleccione una fotografía de referencia."
+        )
+        self._geographic_summary = tk.StringVar(value="")
+        self._geographic_root_text = tk.StringVar(
+            value="No se ha seleccionado una carpeta de imágenes."
+        )
+        self._geographic_review_name = tk.StringVar(
+            value="Sin imágenes para revisar"
+        )
+        self._geographic_review_detail = tk.StringVar(value="")
+        self._geographic_name_matches = []
+        self._geographic_reference = None
+        self._geographic_root = None
+        self._geographic_images = []
+        self._geographic_gps_metadata = GPSMetadataCache()
+        self._geographic_selection = GeographicSelection()
+        self._geographic_preview_photo = None
+        self._geographic_without_gps_count = 0
+
+        content = ttk.Frame(self._geographic_view, padding=(24, 4, 24, 14))
+        content.pack(fill="both", expand=True)
+        ttk.Label(
+            content,
+            text="Buscar por ubicación",
+            style="Section.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            content,
+            text="Carpeta raíz de imágenes:",
+        ).pack(anchor="w", pady=(2, 0))
+        root_selector = ttk.Frame(content)
+        root_selector.pack(fill="x", pady=(3, 10))
+        ttk.Label(
+            root_selector,
+            textvariable=self._geographic_root_text,
+            wraplength=790,
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            root_selector,
+            text="Seleccionar carpeta",
+            command=self._select_geographic_root_folder,
+        ).pack(side="right", padx=(10, 0))
+
+        self._geographic_notebook = ttk.Notebook(content)
+        self._geographic_notebook.pack(fill="x")
+        name_tab = ttk.Frame(self._geographic_notebook, padding=10)
+        coordinates_tab = ttk.Frame(self._geographic_notebook, padding=10)
+        self._geographic_notebook.add(name_tab, text="Buscar por nombre")
+        self._geographic_notebook.add(
+            coordinates_tab,
+            text="Buscar por coordenadas",
+        )
+        self._geographic_notebook.tab(0, state="disabled")
+        self._geographic_notebook.tab(1, state="disabled")
+
+        name_tab.columnconfigure(0, weight=1)
+        ttk.Label(
+            name_tab,
+            text="Nombre completo o parcial:",
+        ).grid(row=0, column=0, sticky="w")
+        name_entry = ttk.Entry(
+            name_tab,
+            textvariable=self._geographic_query,
+        )
+        name_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        name_entry.bind(
+            "<Return>",
+            lambda _event: self._search_geographic_names(),
+        )
+        self._geographic_name_search_button = ttk.Button(
+            name_tab,
+            text="Buscar coincidencias",
+            command=self._search_geographic_names,
+            state="disabled",
+        )
+        self._geographic_name_search_button.grid(row=1, column=1)
+        matches_frame = ttk.Frame(name_tab)
+        matches_frame.grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(8, 0),
+        )
+        self._geographic_matches_text = tk.Text(
+            matches_frame,
+            height=5,
+            font=("Segoe UI", 9),
+            wrap="none",
+            cursor="hand2",
+            state="disabled",
+        )
+        self._geographic_matches_text.tag_configure(
+            "Match.Highlight",
+            background="#FDE047",
+            foreground="#111827",
+        )
+        matches_scrollbar = ttk.Scrollbar(
+            matches_frame,
+            orient="vertical",
+            command=self._geographic_matches_text.yview,
+        )
+        self._geographic_matches_text.configure(
+            yscrollcommand=matches_scrollbar.set
+        )
+        self._geographic_matches_text.pack(
+            side="left", fill="both", expand=True
+        )
+        matches_scrollbar.pack(side="right", fill="y")
+        self._geographic_matches_text.bind(
+            "<ButtonRelease-1>",
+            self._select_geographic_reference,
+        )
+        ttk.Label(
+            name_tab,
+            textvariable=self._geographic_reference_text,
+            justify="left",
+        ).grid(
+            row=3,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(6, 0),
+        )
+
+        coordinates_tab.columnconfigure(1, weight=1)
+        ttk.Label(coordinates_tab, text="Latitud:").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        ttk.Entry(
+            coordinates_tab,
+            textvariable=self._geographic_latitude,
+        ).grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(coordinates_tab, text="Longitud:").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        ttk.Entry(
+            coordinates_tab,
+            textvariable=self._geographic_longitude,
+        ).grid(row=1, column=1, sticky="ew", pady=3)
+
+        controls = ttk.Frame(content)
+        controls.pack(fill="x", pady=(10, 8))
+        ttk.Label(controls, text="Radio (m):").pack(side="left")
+        ttk.Entry(
+            controls,
+            textvariable=self._geographic_radius,
+            width=12,
+        ).pack(side="left", padx=(6, 12))
+        ttk.Label(controls, text="Canales:").pack(side="left")
+        for channel in ("Z", "W", "T"):
+            ttk.Checkbutton(
+                controls,
+                text=channel,
+                variable=self._geographic_channels[channel],
+            ).pack(side="left", padx=(5, 0))
+        self._geographic_search_execute_button = ttk.Button(
+            controls,
+            text="Buscar imágenes cercanas",
+            command=self._run_geographic_search,
+            state="disabled",
+        )
+        self._geographic_search_execute_button.pack(side="left")
+
+        ttk.Label(
+            content,
+            textvariable=self._geographic_summary,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+
+        review_area = ttk.Panedwindow(content, orient="horizontal")
+        review_area.pack(fill="both", expand=True)
+        results_frame = ttk.LabelFrame(
+            review_area,
+            text="Resultados seleccionados",
+            padding=6,
+        )
+        preview_panel = ttk.LabelFrame(
+            review_area,
+            text="Revisión visual",
+            padding=8,
+        )
+        review_area.add(results_frame, weight=2)
+        review_area.add(preview_panel, weight=3)
+        self._geographic_results = ttk.Treeview(
+            results_frame,
+            columns=("name", "distance"),
+            show="headings",
+            selectmode="browse",
+        )
+        self._geographic_results.heading("name", text="Nombre")
+        self._geographic_results.heading(
+            "distance", text="Distancia (m)"
+        )
+        self._geographic_results.column("name", width=330, anchor="w")
+        self._geographic_results.column(
+            "distance", width=130, anchor="e"
+        )
+        results_scrollbar = ttk.Scrollbar(
+            results_frame,
+            orient="vertical",
+            command=self._geographic_results.yview,
+        )
+        self._geographic_results.configure(
+            yscrollcommand=results_scrollbar.set
+        )
+        self._geographic_results.pack(
+            side="left", fill="both", expand=True
+        )
+        results_scrollbar.pack(side="right", fill="y")
+        self._geographic_results.bind(
+            "<<TreeviewSelect>>",
+            self._select_geographic_result,
+        )
+
+        ttk.Label(
+            preview_panel,
+            textvariable=self._geographic_review_name,
+            font=("Segoe UI", 10, "bold"),
+            wraplength=520,
+        ).pack(anchor="w")
+        ttk.Label(
+            preview_panel,
+            textvariable=self._geographic_review_detail,
+            justify="left",
+        ).pack(anchor="w", pady=(3, 6))
+        self._geographic_preview_area = ttk.Frame(preview_panel)
+        self._geographic_preview_area.pack(fill="both", expand=True)
+        self._geographic_viewer = ZoomViewer(
+            self.root,
+            self._geographic_preview_area,
+            self._load_geographic_preview,
+        )
+        navigation = ttk.Frame(preview_panel)
+        navigation.pack(fill="x", pady=(8, 0))
+        self._geographic_previous_button = ttk.Button(
+            navigation,
+            text="Anterior",
+            command=self._previous_geographic_image,
+            state="disabled",
+        )
+        self._geographic_previous_button.pack(side="left")
+        self._geographic_next_button = ttk.Button(
+            navigation,
+            text="Siguiente",
+            command=self._next_geographic_image,
+            state="disabled",
+        )
+        self._geographic_next_button.pack(side="left", padx=(6, 0))
+        self._geographic_remove_button = ttk.Button(
+            navigation,
+            text="Quitar de la selección",
+            command=self._remove_geographic_image,
+            state="disabled",
+        )
+        self._geographic_remove_button.pack(side="left", padx=(14, 0))
+        self._geographic_restore_button = ttk.Button(
+            navigation,
+            text="Restaurar selección",
+            command=self._restore_geographic_selection,
+            state="disabled",
+        )
+        self._geographic_restore_button.pack(side="right")
+        self._geographic_save_button = ttk.Button(
+            navigation,
+            text="Guardar selección",
+            command=self._save_geographic_selection,
+            state="disabled",
+        )
+        self._geographic_save_button.pack(side="right", padx=(0, 8))
+        name_entry.focus_set()
+
+    def _select_geographic_root_folder(self) -> None:
+        selected = filedialog.askdirectory(
+            parent=self.root,
+            title="Seleccionar carpeta raíz de imágenes",
+        )
+        if not selected:
+            return
+        root_folder = Path(selected).resolve()
+        try:
+            images = build_image_inventory(root_folder)
+        except OSError:
+            messagebox.showerror(
+                "Carpeta no disponible",
+                "No fue posible inventariar las fotografías de la carpeta.",
+                parent=self.root,
+            )
+            return
+
+        self._geographic_root = root_folder
+        self._geographic_images = images
+        self._geographic_gps_metadata = GPSMetadataCache()
+        self._geographic_name_matches = []
+        self._geographic_reference = None
+        self._geographic_query.set("")
+        self._geographic_latitude.set("")
+        self._geographic_longitude.set("")
+        self._geographic_matches_text.configure(state="normal")
+        self._geographic_matches_text.delete("1.0", "end")
+        self._geographic_matches_text.configure(state="disabled")
+        self._geographic_reference_text.set(
+            "Busque y seleccione una fotografía de referencia."
+        )
+        self._geographic_selection.replace([])
+        self._geographic_without_gps_count = 0
+        self._geographic_viewer.reset_view()
+        self._refresh_geographic_selection()
+        self._geographic_root_text.set(
+            f"{root_folder} — {len(images)} imágenes JPG encontradas"
+        )
+        state = "normal" if images else "disabled"
+        self._geographic_notebook.tab(0, state=state)
+        self._geographic_notebook.tab(1, state=state)
+        self._geographic_name_search_button.configure(state=state)
+        self._geographic_search_execute_button.configure(state=state)
+        if images:
+            self._geographic_notebook.select(0)
+        else:
+            self._geographic_summary.set(
+                "La carpeta no contiene imágenes JPG.\n"
+                "Encontradas: 0 | Seleccionadas: 0 | Sin GPS válido: 0"
+            )
+
+    def _search_geographic_names(self) -> None:
+        try:
+            search = find_images_by_name(
+                self._geographic_images,
+                self._geographic_query.get(),
+            )
+        except GeographicSearchError as error:
+            self._geographic_name_matches = []
+            self._geographic_reference = None
+            self._geographic_matches_text.configure(state="normal")
+            self._geographic_matches_text.delete("1.0", "end")
+            self._geographic_matches_text.configure(state="disabled")
+            self._geographic_reference_text.set(str(error))
+            return
+
+        parsed_matches = parse_dji_images(search["matches"])
+        channel_order = {"W": 0, "Z": 1, "T": 2}
+        self._geographic_name_matches = [
+            image
+            for _parsed, image in sorted(
+                zip(parsed_matches, search["matches"]),
+                key=lambda item: (
+                    0,
+                    item[0]["date"],
+                    item[0]["time"],
+                    item[0]["sequence"],
+                    channel_order[item[0]["channel"]],
+                )
+                if item[0]["recognized"]
+                else (1, str(item[0]["name"]).casefold(), "", "", 0),
+            )
+        ]
+        self._geographic_reference = None
+        self._geographic_matches_text.configure(state="normal")
+        self._geographic_matches_text.delete("1.0", "end")
+        query = self._geographic_query.get().strip()
+        normalized_query = query.casefold()
+        for line, image in enumerate(self._geographic_name_matches, start=1):
+            name = image["name"]
+            self._geographic_matches_text.insert("end", name + "\n")
+            normalized_name = name.casefold()
+            start = 0
+            while normalized_query:
+                match_at = normalized_name.find(normalized_query, start)
+                if match_at < 0:
+                    break
+                self._geographic_matches_text.tag_add(
+                    "Match.Highlight",
+                    f"{line}.{match_at}",
+                    f"{line}.{match_at + len(query)}",
+                )
+                start = match_at + len(query)
+        self._geographic_matches_text.tag_raise("Match.Highlight")
+        self._geographic_matches_text.configure(state="disabled")
+
+        match_count = len(self._geographic_name_matches)
+        if match_count == 0:
+            self._geographic_reference_text.set(
+                "No se encontraron fotografías con ese nombre."
+            )
+        elif match_count == 1:
+            self._geographic_matches_text.configure(state="normal")
+            self._geographic_matches_text.tag_add(
+                "Selected.Reference", "1.0", "1.end"
+            )
+            self._geographic_matches_text.tag_raise("Match.Highlight")
+            self._geographic_matches_text.configure(state="disabled")
+            self._geographic_reference = self._geographic_name_matches[0]
+            self._geographic_reference_text.set(
+                "Referencia: " + self._geographic_reference["name"]
+            )
+        else:
+            self._geographic_reference_text.set(
+                f"{match_count} coincidencias. Seleccione una referencia."
+            )
+
+    def _select_geographic_reference(self, event: tk.Event) -> None:
+        line = int(
+            self._geographic_matches_text.index(
+                f"@{event.x},{event.y}"
+            ).split(".", 1)[0]
+        )
+        index = line - 1
+        if not 0 <= index < len(self._geographic_name_matches):
+            return
+        self._geographic_reference = self._geographic_name_matches[index]
+        self._geographic_matches_text.configure(state="normal")
+        self._geographic_matches_text.tag_remove(
+            "Selected.Reference", "1.0", "end"
+        )
+        self._geographic_matches_text.tag_add(
+            "Selected.Reference", f"{line}.0", f"{line}.end"
+        )
+        self._geographic_matches_text.tag_raise("Match.Highlight")
+        self._geographic_matches_text.configure(state="disabled")
+        self._geographic_reference_text.set(
+            "Referencia: " + self._geographic_reference["name"]
+        )
+
+    def _run_geographic_search(self) -> None:
+        try:
+            selected_channels = {
+                channel
+                for channel, selected in self._geographic_channels.items()
+                if selected.get()
+            }
+            if not selected_channels:
+                raise GeographicSearchError(
+                    "Seleccione al menos un canal: Z, W o T."
+                )
+            filtered_images = [
+                image
+                for image in parse_dji_images(self._geographic_images)
+                if image.get("recognized")
+                and image.get("channel") in selected_channels
+            ]
+            if self._geographic_notebook.index("current") == 0:
+                if self._geographic_reference is None:
+                    raise GeographicSearchError(
+                        "Seleccione una fotografía de referencia."
+                    )
+                search = search_by_reference_image(
+                    filtered_images,
+                    self._geographic_reference,
+                    self._geographic_radius.get(),
+                    self._geographic_gps_metadata,
+                )
+            else:
+                requested_latitude, requested_longitude = (
+                    validate_coordinate_input(
+                        self._geographic_latitude.get(),
+                        self._geographic_longitude.get(),
+                    )
+                )
+                nearest = find_nearest_gps_image(
+                    self._geographic_images,
+                    requested_latitude,
+                    requested_longitude,
+                    self._geographic_gps_metadata,
+                )
+                if nearest["distance_m"] > 1.0:
+                    approved = messagebox.askyesno(
+                        "Confirmar fotografía de referencia",
+                        (
+                            "No se encontró una fotografía dentro de la "
+                            "tolerancia de 1 m.\n\n"
+                            f"Fotografía más próxima:\n{nearest['name']}\n\n"
+                            "Distancia aproximada: "
+                            f"{nearest['distance_m']:.3f} m\n\n"
+                            "Coordenadas introducidas:\n"
+                            f"{requested_latitude}, {requested_longitude}\n\n"
+                            "Coordenadas GPS propuestas:\n"
+                            f"{nearest['latitude']}, {nearest['longitude']}\n\n"
+                            "¿Desea utilizar esta fotografía como referencia?"
+                        ),
+                        parent=self.root,
+                    )
+                    if not approved:
+                        self._show_geographic_results(
+                            None,
+                            "Búsqueda por coordenadas cancelada.",
+                        )
+                        return
+                self._geographic_latitude.set(
+                    f"{nearest['latitude']:.9f}"
+                )
+                self._geographic_longitude.set(
+                    f"{nearest['longitude']:.9f}"
+                )
+                search = search_by_coordinates(
+                    filtered_images,
+                    nearest["latitude"],
+                    nearest["longitude"],
+                    self._geographic_radius.get(),
+                    self._geographic_gps_metadata,
+                )
+        except GeographicSearchError as error:
+            self._show_geographic_results(None, str(error))
+            return
+        self._show_geographic_results(search)
+
+    def _show_geographic_results(
+        self,
+        search: dict[str, object] | None,
+        error: str | None = None,
+    ) -> None:
+        self._geographic_results.delete(
+            *self._geographic_results.get_children()
+        )
+        if search is None:
+            self._geographic_selection.replace([])
+            self._geographic_without_gps_count = 0
+            self._geographic_viewer.reset_view()
+            self._refresh_geographic_selection()
+            self._geographic_summary.set(
+                (error or "Búsqueda no disponible.")
+                + "\nEncontradas: 0 | Seleccionadas: 0 | "
+                "Sin GPS válido: 0"
+            )
+            return
+        parsed_results = parse_dji_images(
+            [
+                {"name": result["name"], "path": result["path"]}
+                for result in search["results"]
+            ]
+        )
+        channel_order = {"W": 0, "Z": 1, "T": 2}
+        ordered_results = [
+            result
+            for _parsed, result in sorted(
+                zip(parsed_results, search["results"]),
+                key=lambda item: (
+                    0,
+                    item[0]["date"],
+                    item[0]["time"],
+                    item[0]["sequence"],
+                    channel_order[item[0]["channel"]],
+                )
+                if item[0]["recognized"]
+                else (
+                    1,
+                    str(item[0]["name"]).casefold(),
+                    str(item[0]["path"]).casefold(),
+                    "",
+                    0,
+                ),
+            )
+        ]
+        self._geographic_selection.replace(ordered_results)
+        self._geographic_without_gps_count = len(search["without_gps"])
+        self._geographic_viewer.reset_view()
+        self._refresh_geographic_selection()
+
+    def _refresh_geographic_selection(self) -> None:
+        self._geographic_results.delete(
+            *self._geographic_results.get_children()
+        )
+        for index, image in enumerate(
+            self._geographic_selection.selected_results
+        ):
+            self._geographic_results.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(image["name"], f"{image['distance_m']:.3f}"),
+            )
+        summary = (
+            f"Encontradas: {self._geographic_selection.original_count} | "
+            f"Seleccionadas: {self._geographic_selection.selected_count} | "
+            "Sin GPS válido: "
+            f"{self._geographic_without_gps_count}"
+        )
+        self._geographic_summary.set(summary)
+        if self._geographic_selection.current is not None:
+            current_id = str(self._geographic_selection.index)
+            self._geographic_results.selection_set(current_id)
+            self._geographic_results.focus(current_id)
+            self._geographic_results.see(current_id)
+        self._show_current_geographic_image()
+
+    def _select_geographic_result(self, _event: object = None) -> None:
+        selection = self._geographic_results.selection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index == self._geographic_selection.index:
+            return
+        self._geographic_selection.index = index
+        self._geographic_viewer.reset_view()
+        self._show_current_geographic_image()
+
+    def _show_current_geographic_image(self) -> None:
+        current = self._geographic_selection.current
+        count = self._geographic_selection.selected_count
+        if current is None:
+            self._geographic_review_name.set("Sin imágenes seleccionadas")
+            self._geographic_review_detail.set(
+                "Use Restaurar selección para recuperar los resultados."
+            )
+            self._geographic_viewer.source_path = None
+            self._geographic_viewer.configure(image="", text="")
+            self._geographic_preview_photo = None
+        else:
+            self._geographic_review_name.set(str(current["name"]))
+            self._geographic_review_detail.set(
+                f"Distancia: {current['distance_m']:.3f} m | "
+                f"{self._geographic_selection.index + 1} de {count}"
+            )
+            path = Path(current["path"])
+            if self._geographic_viewer.source_path != path:
+                self._geographic_viewer.source_path = path
+                self._geographic_viewer.reset_view()
+            self._load_geographic_preview()
+
+        self._geographic_previous_button.configure(
+            state=(
+                "normal"
+                if current is not None and self._geographic_selection.index > 0
+                else "disabled"
+            )
+        )
+        self._geographic_next_button.configure(
+            state=(
+                "normal"
+                if current is not None
+                and self._geographic_selection.index < count - 1
+                else "disabled"
+            )
+        )
+        self._geographic_remove_button.configure(
+            state="normal" if current is not None else "disabled"
+        )
+        self._geographic_restore_button.configure(
+            state=(
+                "normal"
+                if self._geographic_selection.selected_count
+                < self._geographic_selection.original_count
+                else "disabled"
+            )
+        )
+        self._geographic_save_button.configure(
+            state="normal" if count > 0 else "disabled"
+        )
+
+    def _load_geographic_preview(self) -> None:
+        if (
+            self._geographic_preview_rendering
+            or not hasattr(self, "_geographic_viewer")
+            or self._geographic_viewer.source_path is None
+        ):
+            return
+        self._geographic_preview_rendering = True
+        try:
+            width = max(self._geographic_viewer.winfo_width() - 8, 320)
+            height = max(self._geographic_viewer.winfo_height() - 8, 240)
+            with Image.open(self._geographic_viewer.source_path) as source:
+                original = ImageOps.exif_transpose(source).copy()
+            fit_scale = min(width / original.width, height / original.height)
+            fit_size = (
+                max(round(original.width * fit_scale), 1),
+                max(round(original.height * fit_scale), 1),
+            )
+            self._geographic_viewer.set_content_size(*fit_size)
+            scaled_size = (
+                max(
+                    round(
+                        fit_size[0] * self._geographic_viewer.zoom_factor
+                    ),
+                    1,
+                ),
+                max(
+                    round(
+                        fit_size[1] * self._geographic_viewer.zoom_factor
+                    ),
+                    1,
+                ),
+            )
+            preview = original.resize(scaled_size, Image.Resampling.LANCZOS)
+            if self._geographic_viewer.zoom_factor > 1.0:
+                crop_width = min(width, scaled_size[0])
+                crop_height = min(height, scaled_size[1])
+                left = round(
+                    (scaled_size[0] - crop_width) / 2
+                    - self._geographic_viewer.offset_x
+                )
+                top = round(
+                    (scaled_size[1] - crop_height) / 2
+                    - self._geographic_viewer.offset_y
+                )
+                left = min(max(left, 0), scaled_size[0] - crop_width)
+                top = min(max(top, 0), scaled_size[1] - crop_height)
+                preview = preview.crop(
+                    (left, top, left + crop_width, top + crop_height)
+                )
+            photo = ImageTk.PhotoImage(preview)
+            self._geographic_preview_photo = photo
+            self._geographic_viewer.configure(image=photo, text="")
+        except (OSError, ValueError):
+            self._geographic_preview_photo = None
+            self._geographic_viewer.configure(
+                image="", text="No se pudo previsualizar"
+            )
+        finally:
+            self._geographic_preview_rendering = False
+
+    def _previous_geographic_image(self) -> None:
+        self._geographic_selection.previous()
+        self._geographic_viewer.reset_view()
+        self._refresh_geographic_selection()
+
+    def _next_geographic_image(self) -> None:
+        self._geographic_selection.next()
+        self._geographic_viewer.reset_view()
+        self._refresh_geographic_selection()
+
+    def _remove_geographic_image(self) -> None:
+        self._geographic_selection.remove_current()
+        self._geographic_viewer.reset_view()
+        self._refresh_geographic_selection()
+
+    def _restore_geographic_selection(self) -> None:
+        self._geographic_selection.restore()
+        self._geographic_viewer.reset_view()
+        self._refresh_geographic_selection()
+
+    def _save_geographic_selection(self) -> None:
+        if (
+            self._geographic_root is None
+            or self._geographic_selection.selected_count == 0
+        ):
+            return
+        folder_name = simpledialog.askstring(
+            "Guardar selección",
+            "Nombre de la nueva subcarpeta:",
+            parent=self.root,
+        )
+        if folder_name is None:
+            return
+        if not messagebox.askyesno(
+            "Confirmar exportación",
+            (
+                f"Se exportarán "
+                f"{self._geographic_selection.selected_count} fotografías "
+                f"a la subcarpeta:\n\n{folder_name}\n\n"
+                "También se generará un archivo KMZ autocontenido."
+            ),
+            parent=self.root,
+        ):
+            return
+        try:
+            result = export_geographic_selection(
+                self._geographic_root,
+                folder_name,
+                self._geographic_selection.selected_results,
+            )
+        except GeographicExportError as error:
+            messagebox.showerror(
+                "No se pudo guardar la selección",
+                str(error),
+                parent=self.root,
+            )
+            return
+        messagebox.showinfo(
+            "Selección guardada",
+            (
+                f"Fotografías guardadas: {result['image_count']}\n\n"
+                f"Subcarpeta:\n{result['destination_folder']}\n\n"
+                f"KMZ:\n{Path(result['kmz_path']).name}"
+            ),
+            parent=self.root,
+        )
+
     def _reset_for_new_project(self) -> None:
         if self._alternative_click_job is not None:
             self.root.after_cancel(self._alternative_click_job)
@@ -2110,7 +2970,6 @@ class MainWindow:
             self.output_is_stale = False
             if not self._show_project_check_dialog(root_folder):
                 return
-            self._prepare_set_ids_for_root(root_folder)
 
             try:
                 records = read_project_excel(root_folder)
@@ -2151,6 +3010,7 @@ class MainWindow:
             unrecognized = [
                 image for image in parsed_images if not image["recognized"]
             ]
+            self._prepare_set_ids_for_root(root_folder)
             self._records = records
             self._images = images
             self._recognized_count = recognized_count
