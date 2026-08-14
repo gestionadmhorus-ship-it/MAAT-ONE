@@ -1,0 +1,209 @@
+name: Publicar Release oficial
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Validar, construir y publicar
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Obtener repositorio
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configurar Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          check-latest: false
+
+      - name: Validar tag y version.json
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          match = re.fullmatch(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", tag)
+          if match is None:
+              raise SystemExit(f"Tag SemVer no valido: {tag!r}; se esperaba vMAJOR.MINOR.PATCH")
+
+          tag_version = ".".join(match.groups())
+          try:
+              version_data = json.loads(Path("version.json").read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as exc:
+              raise SystemExit(f"version.json no es valido: {exc}") from exc
+
+          if not isinstance(version_data, dict) or set(version_data) != {"version"}:
+              raise SystemExit("version.json debe contener unicamente la clave 'version'")
+
+          file_version = version_data["version"]
+          if not isinstance(file_version, str) or re.fullmatch(
+              r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", file_version
+          ) is None:
+              raise SystemExit(f"Version local no valida: {file_version!r}")
+
+          if tag_version != file_version:
+              raise SystemExit(
+                  f"El tag {tag!r} no coincide con version.json ({file_version!r})"
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={file_version}\n")
+          print(f"Version validada: {file_version}")
+          PY
+
+      - name: Comprobar que la Release no exista
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Ya existe una Release para el tag $GITHUB_REF_NAME; no se sobrescribira."
+            exit 1
+          fi
+
+      - name: Validar fuentes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import py_compile
+          from pathlib import Path
+
+          sources = sorted((*Path(".").rglob("*.py"), *Path(".").rglob("*.pyw")))
+          if not sources:
+              raise SystemExit("No se encontraron fuentes Python para validar")
+          for source in sources:
+              py_compile.compile(str(source), doraise=True)
+          print(f"Sintaxis valida: {len(sources)} archivos Python/PYW")
+          PY
+          empty_tree="$(git hash-object -t tree /dev/null)"
+          git diff --check "$empty_tree" HEAD
+
+      - name: Construir paquete oficial
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/build_release.py
+
+      - name: Validar artefactos oficiales
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          from src.update_service import _validate_zip_package
+
+          version = os.environ["VERSION"]
+          output_dir = Path("release_dist")
+          zip_path = output_dir / f"MAAT-One-{version}.zip"
+          checksum_path = output_dir / f"MAAT-One-{version}.zip.sha256"
+
+          if not zip_path.is_file():
+              raise SystemExit(f"No se genero el ZIP esperado: {zip_path}")
+          if not checksum_path.is_file():
+              raise SystemExit(f"No se genero el checksum esperado: {checksum_path}")
+
+          produced = sorted(path.name for path in output_dir.iterdir() if path.is_file())
+          expected = sorted((zip_path.name, checksum_path.name))
+          if produced != expected:
+              raise SystemExit(
+                  f"release_dist contiene artefactos inesperados: {produced}; esperados: {expected}"
+              )
+
+          checksum_line = checksum_path.read_text(encoding="ascii").strip()
+          checksum_match = re.fullmatch(r"([0-9a-f]{64})  (.+)", checksum_line)
+          if checksum_match is None or checksum_match.group(2) != zip_path.name:
+              raise SystemExit("El archivo .sha256 tiene un formato o nombre de ZIP incorrecto")
+          actual_digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          if actual_digest != checksum_match.group(1):
+              raise SystemExit("El SHA-256 publicado no coincide con el ZIP")
+
+          forbidden_dirs = {
+              ".git", ".github", ".venv", "venv", ".maat_update", "releases",
+              "release_dist", "__pycache__", "build", "dist",
+          }
+          forbidden_suffixes = {
+              ".pyc", ".pyo", ".log", ".lnk", ".jpg", ".jpeg", ".png",
+              ".xlsx", ".xls", ".kmz", ".zip",
+          }
+
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              corrupt = archive.testzip()
+              if corrupt is not None:
+                  raise SystemExit(f"Entrada corrupta dentro del ZIP: {corrupt}")
+
+              names = archive.namelist()
+              if len(names) != len(set(names)):
+                  raise SystemExit("El ZIP contiene rutas duplicadas")
+
+              normalized = [PurePosixPath(name) for name in names]
+              prohibited = []
+              for path in normalized:
+                  lowered_parts = {part.casefold() for part in path.parts}
+                  if lowered_parts & forbidden_dirs:
+                      prohibited.append(path.as_posix())
+                  elif path.suffix.casefold() in forbidden_suffixes:
+                      prohibited.append(path.as_posix())
+                  elif path.name.casefold() == "current.json":
+                      prohibited.append(path.as_posix())
+              if prohibited:
+                  raise SystemExit(f"El ZIP contiene archivos prohibidos: {prohibited}")
+
+              required = {
+                  "app.py", "install.ps1", "launcher.pyw", "README.md",
+                  "requirements.txt", "version.json",
+              }
+              missing = sorted(required - set(names))
+              if missing or not any(name.startswith("src/") for name in names):
+                  raise SystemExit(f"Contenido obligatorio ausente del ZIP: {missing}")
+
+              packaged_version = json.loads(archive.read("version.json"))["version"]
+              if packaged_version != version:
+                  raise SystemExit(
+                      f"Version empaquetada {packaged_version!r} distinta del tag {version!r}"
+                  )
+
+          _validate_zip_package(zip_path, local_version="0.0.0", remote_version=version)
+          print(f"Artefactos validados: {zip_path.name} y {checksum_path.name}")
+          PY
+
+      - name: Publicar GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            "release_dist/MAAT-One-${VERSION}.zip" \
+            "release_dist/MAAT-One-${VERSION}.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --latest \
+            --title "MAAT One ${VERSION}" \
+            --notes "Release oficial de MAAT One ${VERSION}."
