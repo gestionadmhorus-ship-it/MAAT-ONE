@@ -6,6 +6,8 @@ import subprocess
 from tkinter import messagebox
 from typing import Callable
 
+from src.update_service import check_for_updates
+
 
 PythonCommand = list[str]
 ExecutableFinder = Callable[[str], str | None]
@@ -42,10 +44,21 @@ def show_error(message: str) -> None:
     messagebox.showerror("MAAT One", message)
 
 
+def show_update_available(local_version: str, remote_version: str) -> None:
+    """Informa temporalmente una actualización detectada sin instalarla."""
+    messagebox.showinfo(
+        "Actualización disponible",
+        f"Versión instalada: {local_version}\n"
+        f"Versión disponible: {remote_version}\n\n"
+        "La actualización automática se incorporará en el siguiente paso.",
+    )
+
+
 def launch(
     root: Path | None = None,
     finder: ExecutableFinder = shutil.which,
     error_handler: Callable[[str], None] = show_error,
+    update_handler: Callable[[str, str], None] = show_update_available,
 ) -> bool:
     """Inicia app.py con el intérprete disponible y la raíz como directorio."""
     install_root = (root or installation_root()).resolve()
@@ -63,6 +76,13 @@ def launch(
             "Instale Python 3 para Windows o prepare el entorno virtual .venv."
         )
         return False
+
+    update_check = check_for_updates(install_root)
+    if update_check["status"] == "update_available":
+        update_handler(
+            str(update_check["local_version"]),
+            str(update_check["remote_version"]),
+        )
 
     try:
         subprocess.Popen(
