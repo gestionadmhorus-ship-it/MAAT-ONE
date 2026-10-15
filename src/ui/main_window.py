@@ -239,6 +239,9 @@ class MainWindow:
         self.dark_mode = False
         self._theme = self.LIGHT_THEME
         self.root.title("MAAT One")
+        icon = Path(__file__).resolve().parents[2] / "assets" / "maat-one.ico"
+        if icon.is_file():
+            self.root.iconbitmap(str(icon))
         self.root.geometry("1280x800")
         self.root.minsize(1050, 680)
         self.root.configure(background=self._theme["background"])

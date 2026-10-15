@@ -1,8 +1,7 @@
 # MAAT One
 
 MAAT One es una aplicación local para Windows destinada a preparar los SET de
-imágenes que posteriormente utilizará MAAT. En esta primera fase incluye
-únicamente la interfaz inicial y la selección de una carpeta raíz.
+imágenes que posteriormente utilizará MAAT. Incluye revisión y selección manual, asociación de imágenes y exportación de anomalías.
 
 ## Buscador por coordenadas
 
@@ -76,3 +75,14 @@ El Excel Anomalias.xlsx registra FECHA, HORA DE ARCHIVO y NUMERO DE ARCHIVO
 obtenidos de la Zoom finalmente elegida y copiada. Los demás datos provienen
 del registro original. La trazabilidad conserva la referencia original y las
  diferencias con la imagen aprobada. Aplica a ambos modos de salida.
+
+## Instalación en otra PC (Windows 10/11 x64)
+
+Descargue `MAAT-One-1.1.0-Windows.zip` desde Releases, extraiga todo y abra
+`MAAT-One-1.1.0-Setup.exe`. El asistente incluye Python y las dependencias; crea
+accesos directos con icono en el escritorio y el menú Inicio. No requiere Python
+preinstalado ni conexión durante la instalación. Instala solo para el usuario actual.
+El ZIP sin `Windows` se conserva para el actualizador de instalaciones desde Python.
+
+El código fuente y su historial permanecen en GitHub. Los proyectos, imágenes y
+Excel del usuario no forman parte del instalador.
