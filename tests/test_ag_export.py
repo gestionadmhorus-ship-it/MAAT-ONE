@@ -61,7 +61,7 @@ class AGExportTests(unittest.TestCase):
             self.assertEqual(len(find_project_excels(root)),1)
             images,duplicates=inventory_project_images(root)
             self.assertEqual(len(images),3); self.assertFalse(duplicates)
-            self.assertEqual(dest, root)
+            self.assertEqual(dest, root.resolve())
             with self.assertRaises(ValueError): export_plan(plan)
             self.assertTrue(trace.exists())
             self.assertFalse(list(root.glob(".maat-one*")))

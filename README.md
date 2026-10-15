@@ -78,8 +78,8 @@ del registro original. La trazabilidad conserva la referencia original y las
 
 ## Instalación en otra PC (Windows 10/11 x64)
 
-Descargue `MAAT-One-1.1.0-Windows.zip` desde Releases, extraiga todo y abra
-`MAAT-One-1.1.0-Setup.exe`. El asistente incluye Python y las dependencias; crea
+Descargue `MAAT-One-1.1.1-Windows.zip` desde Releases, extraiga todo y abra
+`MAAT-One-1.1.1-Setup.exe`. El asistente incluye Python y las dependencias; crea
 accesos directos con icono en el escritorio y el menú Inicio. No requiere Python
 preinstalado ni conexión durante la instalación. Instala solo para el usuario actual.
 El ZIP sin `Windows` se conserva para el actualizador de instalaciones desde Python.
