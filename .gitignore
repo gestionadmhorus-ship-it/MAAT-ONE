@@ -12,6 +12,9 @@ dist/
 .env.*
 
 *.log
+.maat_update/
+releases/
+release_dist/
 
 Thumbs.db
 .DS_Store

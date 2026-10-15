@@ -134,7 +134,7 @@ def _trace_row(record: dict[str, object]) -> tuple[object, ...]:
     return (
         set_id, record["row_number"], record["file_reference"],
         record["normalized_date"] or "", record["target_time"] or "",
-        record["status"], record["validation"] or "", 
+        record["status"], record["validation"] or "",
         _approved_text(record["approved"]), record["filename"] or "",
         record["original_suggested_filename"] or "",
         record["final_used_filename"] or "",
