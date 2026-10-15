@@ -4,7 +4,7 @@ from pathlib import Path
 from shutil import copy2
 
 
-def copy_planned_images(plan: dict[str, object]) -> dict[str, object]:
+def copy_planned_images(plan: dict[str, object], progress=None) -> dict[str, object]:
     """Copia los archivos del plan sin sobrescribir destinos existentes."""
     destination_folder = Path(plan["destination_folder"])
     copied: list[str] = []
@@ -13,6 +13,8 @@ def copy_planned_images(plan: dict[str, object]) -> dict[str, object]:
     source_missing: list[dict[str, str]] = []
     errors: list[dict[str, str]] = []
 
+    total = sum(value is not None for item in plan["sets"] for value in item["absolute_paths"].values())
+    completed = 0
     for planned_set in plan["sets"]:
         paths = planned_set["absolute_paths"]
         filenames = planned_set["filenames"]
@@ -28,6 +30,9 @@ def copy_planned_images(plan: dict[str, object]) -> dict[str, object]:
                 )
                 continue
 
+            completed += 1
+            if progress:
+                progress(f"Copiando {planned_set['set_id']}: imagen {completed} de {total}", completed, total)
             source = Path(source_value)
             destination = destination_folder / filename
             if destination.exists():

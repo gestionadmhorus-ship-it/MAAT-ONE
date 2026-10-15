@@ -136,6 +136,7 @@ def build_output_plan(
                     else None
                 ),
                 "override_reason": zoom_result.get("override_reason"),
+                "manual_added": zoom_result.get("manual_added", False),
                 "override_distance_m": zoom_result.get(
                     "override_distance_m"
                 ),

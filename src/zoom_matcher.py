@@ -47,15 +47,17 @@ def normalize_date(value: object) -> str | None:
 
 
 def extract_target_time(file_reference: object) -> tuple[str, int] | None:
-    """Extrae una hora HHMMSS válida sin limpiar formatos ambiguos."""
-    reference = str(file_reference).strip()
-    if TIME_PATTERN.fullmatch(reference):
-        time_text = reference
-    else:
-        parsed_reference = parse_dji_image({"name": reference, "path": ""})
-        if not parsed_reference["recognized"]:
+    """Interpreta G como HHMMSS; recupera ceros iniciales perdidos por Excel."""
+    if isinstance(file_reference, bool):
+        return None
+    if isinstance(file_reference, float):
+        if not file_reference.is_integer():
             return None
-        time_text = parsed_reference["time"]
+        file_reference = int(file_reference)
+    reference = str(file_reference).strip()
+    if not re.fullmatch(r"[0-9]{1,6}", reference):
+        return None
+    time_text = reference.zfill(6)
     try:
         parsed_time = datetime.strptime(time_text, "%H%M%S")
     except ValueError:
@@ -88,14 +90,14 @@ def match_zoom_images(
             "validation": "NONE",
             "approved": None,
         }
-        if target is None:
+        if target is None or normalized_date is None:
             results.append({**base_result, "status": "INVALID_REFERENCE"})
             continue
 
         candidates = [
             image
             for image in zoom_images
-            if (normalized_date is None or image["date"] == normalized_date)
+            if image["date"] == normalized_date
             and abs(image["time_seconds"] - target[1]) <= 5
         ]
         if not candidates:
@@ -151,6 +153,7 @@ def match_zoom_images(
 def decide_zoom(result: dict[str, object], approved: bool) -> None:
     """Registra o cambia en memoria la decisión sobre una Zoom revisable."""
     reviewable_statuses = {
+        "ZOOM_EXACT",
         "ZOOM_PENDING_REVIEW",
         "ZOOM_ACCEPTED",
         "ZOOM_REJECTED",

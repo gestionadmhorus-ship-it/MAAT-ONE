@@ -1,21 +1,14 @@
-"""Inventario de imágenes JPG contenidas en Materiales."""
+"""Inventario de imágenes JPG contenidas en la raíz y sus subcarpetas."""
 
 from pathlib import Path
+from src.project_files import input_files
 
 
-def find_materials_folder(root_folder: Path) -> Path:
-    """Localiza la carpeta Materiales entre los hijos directos de la raíz."""
-    for entry in root_folder.iterdir():
-        if entry.is_dir() and entry.name.casefold() == "materiales":
-            return entry
-    raise ValueError("No se encontró la carpeta Materiales.")
-
-
-def build_image_inventory(materials_folder: Path) -> list[dict[str, str]]:
-    """Recorre Materiales y conserva nombre y ruta de cada JPG."""
+def build_image_inventory(root_folder: Path) -> list[dict[str, str]]:
+    """Recorre la raíz y sus subcarpetas y conserva nombre y ruta de cada JPG."""
     images = [
         {"name": path.name, "path": str(path.resolve())}
-        for path in materials_folder.rglob("*")
+        for path in input_files(root_folder)
         if path.is_file() and path.suffix.casefold() == ".jpg"
     ]
     return sorted(images, key=lambda image: image["path"].casefold())
@@ -39,7 +32,6 @@ def detect_duplicate_names(
 def inventory_project_images(
     root_folder: Path,
 ) -> tuple[list[dict[str, str]], dict[str, list[str]]]:
-    """Construye el inventario y detecta duplicados dentro de Materiales."""
-    materials_folder = find_materials_folder(root_folder)
-    images = build_image_inventory(materials_folder)
+    """Construye el inventario y detecta duplicados dentro de la raíz y sus subcarpetas."""
+    images = build_image_inventory(root_folder)
     return images, detect_duplicate_names(images)

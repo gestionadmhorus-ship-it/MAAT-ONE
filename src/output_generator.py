@@ -7,6 +7,8 @@ import shutil
 import tempfile
 from uuid import uuid4
 
+from src.excel_reader import find_project_excels
+
 
 class OutputGenerationError(Exception):
     """Error controlado durante el precheck o la generación final."""
@@ -17,22 +19,10 @@ def _identity(item: dict[str, object]) -> tuple[object, str]:
 
 
 def _find_project_inputs(root_folder: Path) -> tuple[Path, Path]:
-    entries = list(root_folder.iterdir())
-    materials = [
-        entry
-        for entry in entries
-        if entry.is_dir() and entry.name.casefold() == "materiales"
-    ]
-    excels = [
-        entry
-        for entry in entries
-        if entry.is_file()
-        and not entry.name.startswith("~$")
-        and entry.suffix.casefold() in {".xlsx", ".xls"}
-    ]
-    if len(materials) != 1 or len(excels) != 1:
-        raise OutputGenerationError("La estructura del proyecto ya no es válida.")
-    return materials[0], excels[0]
+    excels = find_project_excels(root_folder)
+    if len(excels) != 1:
+        raise OutputGenerationError("El proyecto debe contener un único Excel.")
+    return root_folder, excels[0]
 
 
 def _select_source_images(

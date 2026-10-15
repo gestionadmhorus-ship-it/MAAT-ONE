@@ -7,54 +7,39 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageOps, ImageTk
 
 from src.dji_parser import parse_dji_images
+from src.manual_sets import manual_record, link_zoom, record_details
 from src.excel_traceability import TraceabilityError, generate_traceability_excel
-from src.excel_reader import read_project_excel
+from src.excel_reader import find_project_excels, read_project_excel
 from src.gps_metadata import GPSMetadataCache
 from src.image_inventory import inventory_project_images
-from src.output_copier import copy_planned_images
+from src.safe_export import export_plan, UNIFIED, SEPARATED
+from src.ui.progress_dialog import run_task
 from src.output_planner import build_output_plan
 from src.set_builder import build_sets
+from src.anomaly_view import describe_anomalies
 from src.zoom_matcher import decide_zoom, match_zoom_images
+from src.ui.coordinate_search_window import CoordinateSearchWindow
 
 
 def validate_root_folder(root_folder: Path) -> str:
-    """Valida únicamente los elementos hijos directos de la carpeta raíz."""
-    entries = list(root_folder.iterdir())
-
-    materials_found = any(
-        entry.is_dir() and entry.name.casefold() == "materiales"
-        for entry in entries
-    )
-    if not materials_found:
-        return (
-            "Proyecto no válido\n"
-            "No se encontró la carpeta Materiales en la raíz."
-        )
-
-    excel_files = [
-        entry
-        for entry in entries
-        if entry.is_file()
-        and not entry.name.startswith("~$")
-        and not entry.name.startswith("Trazabilidad MAAT One ")
-        and entry.suffix.casefold() in {".xlsx", ".xls"}
-    ]
+    """Valida que el proyecto contenga exactamente un Excel."""
+    excel_files = find_project_excels(root_folder)
     if not excel_files:
         return (
             "Proyecto no válido\n"
-            "No se encontró un archivo Excel en la raíz."
+            "No se encontró un archivo Excel en la carpeta seleccionada ni en sus subcarpetas."
         )
     if len(excel_files) > 1:
         return (
             "Proyecto no válido\n"
-            "Se encontró más de un archivo Excel en la raíz."
+            "Se encontró más de un archivo Excel. Deje solo uno dentro de la carpeta seleccionada y sus subcarpetas."
         )
 
     return (
         "Proyecto válido\n"
         f"Carpeta: {root_folder.name}\n"
         f"Excel: {excel_files[0].name}\n"
-        "Materiales: encontrada"
+        "Imágenes: se buscarán en la raíz y todas sus subcarpetas"
     )
 
 
@@ -272,8 +257,12 @@ class MainWindow:
         self._review_preview_rendering = False
         self._review_preview_transitioning = False
 
+        self._excluded_history = []
+        self._left_images = {}
         self._configure_styles()
         self._build_interface()
+        self.zoom_viewer.bind("<Double-Button-1>", lambda e: self._open_fullscreen_review())
+        self._wrap_buttons(self.root)
 
     def _distance_from_suggested(
         self,
@@ -418,33 +407,46 @@ class MainWindow:
         self.theme_button.configure(text="Claro" if self.dark_mode else "Oscuro")
 
     def _build_interface(self) -> None:
-        content = ttk.Frame(self.root, style="App.TFrame", padding=(24, 14))
+        content = ttk.Frame(self.root, style="App.TFrame", padding=(10, 8))
         content.pack(fill="both", expand=True)
 
+        workspace = ttk.Panedwindow(content, orient="horizontal")
+        workspace.pack(fill="both", expand=True)
+        self.workspace_panes = workspace
+        left_column = ttk.Frame(workspace, width=360)
+        left_column.pack_propagate(False)
+        sidebar = ttk.Frame(left_column, padding=(6, 0, 6, 4))
+        sidebar.pack(fill="x")
         self.theme_button = ttk.Button(
-            content,
+            sidebar,
             text="Oscuro",
             command=self._toggle_theme,
             style="Theme.TButton",
         )
-        self.theme_button.place(relx=1.0, x=0, y=0, anchor="ne")
+        self.theme_button.pack(side="right", anchor="n")
 
-        ttk.Label(content, text="MAAT One", style="Title.TLabel").pack()
+        ttk.Label(sidebar, text="MAAT One", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(0, 4))
         ttk.Label(
-            content,
-            text="Preparación Inteligente de SET de Imágenes",
+            sidebar,
+            text="Revisión de imágenes",
             style="Subtitle.TLabel",
         ).pack(pady=(2, 8))
 
         ttk.Button(
-            content,
+            sidebar,
             text="Seleccionar carpeta raíz",
             command=self._select_root_folder,
             style="Action.TButton",
             cursor="hand2",
         ).pack()
+        ttk.Button(
+            sidebar,
+            text="Buscador por coordenadas",
+            command=self._open_coordinate_search,
+            cursor="hand2",
+        ).pack(pady=(4, 0))
         self.finalize_button = ttk.Button(
-            content,
+            sidebar,
             text="Finalizar y generar",
             command=self._finalize_output,
             state="disabled",
@@ -452,21 +454,15 @@ class MainWindow:
         self.finalize_button.pack(pady=(4, 0))
         self.output_plan_summary = tk.StringVar(value="")
         ttk.Label(
-            content,
+            sidebar,
             textvariable=self.output_plan_summary,
             style="Status.TLabel",
+            wraplength=180,
             justify="left",
         ).pack(pady=(3, 0))
 
-        ttk.Separator(content, orient="horizontal").pack(
-            fill="x", pady=(12, 10)
-        )
-        workspace = ttk.Frame(content, style="App.TFrame")
-        workspace.pack(fill="both", expand=True)
-        workspace.columnconfigure(0, weight=9, uniform="workspace")
-        workspace.columnconfigure(1, weight=11, uniform="workspace")
-        workspace.rowconfigure(0, weight=1)
-        result_area = ttk.Frame(workspace, style="App.TFrame")
+        result_area = ttk.Frame(left_column, style="App.TFrame")
+        result_area.pack(fill="both", expand=True)
         ttk.Label(result_area, text="Estado:", style="Section.TLabel").pack(
             anchor="w"
         )
@@ -480,7 +476,7 @@ class MainWindow:
             highlightthickness=0,
             wrap="word",
             state="disabled",
-            height=5,
+            height=3,
         )
         scrollbar = ttk.Scrollbar(
             text_area,
@@ -493,25 +489,43 @@ class MainWindow:
 
         set_panel = ttk.LabelFrame(
             result_area,
-            text="Verificación de SET",
+            text="Anomalías del Excel y agregadas",
             padding=(8, 6),
         )
         set_panel.pack(fill="both", expand=True, pady=(6, 0))
+        list_frame = ttk.Frame(set_panel)
+        list_frame.pack(fill="x")
         self.set_list = tk.Listbox(
-            set_panel,
-            height=3,
+            list_frame,
+            height=6,
             font=("Segoe UI", 9),
             exportselection=False,
         )
-        self.set_list.pack(fill="x")
+        self.set_list.pack(side="left", fill="x", expand=True)
+        self.set_scrollbar = ttk.Scrollbar(list_frame, command=self.set_list.yview)
+        self.set_scrollbar.pack(side="right", fill="y")
+        self.set_list.configure(yscrollcommand=self.set_scrollbar.set)
+        def scroll_sets(event):
+            direction = -1 if getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0 else 1
+            self.set_list.yview_scroll(direction * 3, "units")
+            return "break"
+        for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.set_list.bind(event, scroll_sets)
+        manual_buttons = ttk.Frame(set_panel)
+        manual_buttons.pack(fill="x", pady=3)
+        ttk.Button(manual_buttons, text="Vincular Zoom manualmente", command=self._link_manual_zoom).pack(fill="x")
+        ttk.Button(manual_buttons, text="Agregar SET manual", command=self._add_manual_set).pack(fill="x")
+        ttk.Button(manual_buttons, text="Quitar SET seleccionado", command=self._exclude_set).pack(fill="x")
+        ttk.Button(manual_buttons, text="Deshacer última exclusión", command=self._undo_exclude).pack(fill="x")
         self.set_list.bind("<<ListboxSelect>>", self._on_set_selected)
         self.set_details = ttk.Label(
             set_panel,
             text="Sin SET disponibles",
             justify="left",
-            wraplength=520,
+            wraplength=320,
         )
         self.set_details.pack(anchor="w", fill="x", pady=(4, 3))
+        set_panel.bind("<Configure>", lambda event: self.set_details.configure(wraplength=max(180, event.width - 24)))
         set_previews = ttk.Frame(set_panel)
         set_previews.pack(fill="x")
         self.set_preview_labels: dict[str, ttk.Label] = {}
@@ -523,10 +537,11 @@ class MainWindow:
                 preview_area,
                 text="NO ENCONTRADA",
                 anchor="center",
-                width=18,
+                width=9,
             )
             preview_label.pack(fill="both", expand=True)
             self.set_preview_labels[channel] = preview_label
+            preview_label.bind("<Double-Button-1>", lambda e, key=channel: self._open_image_popup(self._left_images.get(key)))
         text_area.pack(fill="x", pady=(4, 0))
 
         review_panel = ttk.LabelFrame(
@@ -534,8 +549,9 @@ class MainWindow:
             text="Revisión de Zoom",
             padding=(10, 7),
         )
-        result_area.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-        review_panel.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        workspace.add(left_column, weight=1)
+        workspace.add(review_panel, weight=3)
+        self.root.after(150, lambda: workspace.sashpos(0, max(300, int(workspace.winfo_width() * 0.25))))
         review_panel.columnconfigure(0, weight=1)
         review_panel.rowconfigure(3, weight=1)
         mode_selector = ttk.Combobox(
@@ -565,18 +581,50 @@ class MainWindow:
         self.review_list.bind("<<ListboxSelect>>", self._on_review_selected)
         review_body = ttk.Frame(review_panel)
         review_body.grid(row=3, column=0, sticky="nsew", pady=(3, 0))
-        review_body.columnconfigure(0, weight=1)
-        review_body.columnconfigure(1, weight=5)
+        review_body.columnconfigure(0, weight=1, uniform="review_columns")
+        review_body.columnconfigure(1, weight=3, uniform="review_columns")
         review_body.rowconfigure(0, weight=1)
-        self.review_details = ttk.Label(
-            review_body,
-            text="",
-            justify="left",
-            wraplength=165,
-        )
-        self.review_details.grid(
-            row=0, column=0, sticky="nsew", padx=(0, 6)
-        )
+        details_panel = ttk.Frame(review_body, width=240)
+        details_panel.grid_propagate(False)
+        details_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        details_panel.rowconfigure(2, weight=1)
+        self.excel_highlights = {}
+        highlight_panel = ttk.Frame(details_panel)
+        highlight_panel.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        for key in ("elemento", "anomalia", "criticidad"):
+            label = tk.Label(highlight_panel, text="", font=("Segoe UI", 12, "bold"),
+                             anchor="w", justify="left", wraplength=245,
+                             background="#E8F0FE", foreground="#123E82", padx=7, pady=5)
+            label.pack(fill="x", pady=2)
+            self.excel_highlights[key] = label
+        details_panel.columnconfigure(0, weight=1)
+        details_canvas = tk.Canvas(details_panel, width=250, height=150,
+                                   highlightthickness=0, background=self._theme["background"])
+        details_scroll = ttk.Scrollbar(details_panel, orient="vertical", command=details_canvas.yview)
+        details_canvas.configure(yscrollcommand=details_scroll.set)
+        details_canvas.grid(row=2, column=0, sticky="nsew")
+        details_scroll.grid(row=2, column=1, sticky="ns")
+        self.review_details = ttk.Label(details_canvas, text="", justify="left", anchor="nw", wraplength=240)
+        details_window = details_canvas.create_window((0, 0), window=self.review_details, anchor="nw")
+        self.review_details.bind("<Configure>", lambda event: details_canvas.configure(scrollregion=details_canvas.bbox("all")))
+        def resize_details(event):
+            details_canvas.itemconfigure(details_window, width=event.width)
+            self.review_details.configure(wraplength=max(100, event.width - 10))
+        details_canvas.bind("<Configure>", resize_details)
+        self.review_details_canvas = details_canvas
+        details_canvas.grid_remove()
+        details_scroll.grid_remove()
+        details_open = tk.BooleanVar(value=False)
+        def toggle_details():
+            if details_open.get():
+                details_canvas.grid(); details_scroll.grid()
+            else:
+                details_canvas.grid_remove(); details_scroll.grid_remove()
+        ttk.Checkbutton(details_panel, text="Detalles técnicos", variable=details_open, command=toggle_details).grid(row=1, column=0, columnspan=2, sticky="w")
+        def wrap_highlights(event):
+            for label in self.excel_highlights.values():
+                label.configure(wraplength=max(120, event.width-20))
+        details_panel.bind("<Configure>", wrap_highlights)
         self.review_preview_area = ttk.Frame(
             review_body,
         )
@@ -596,6 +644,10 @@ class MainWindow:
         )
         decisions = ttk.Frame(review_panel)
         decisions.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        navigation = ttk.Frame(review_panel)
+        navigation.grid(row=6, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(navigation, text="← SET anterior", command=lambda: self._navigate_set(-1)).pack(side="left")
+        ttk.Button(navigation, text="SET siguiente →", command=lambda: self._navigate_set(1)).pack(side="right")
         self.reject_button = ttk.Button(
             decisions,
             text="Rechazar",
@@ -643,11 +695,15 @@ class MainWindow:
         self._review_preview_transitioning = True
         try:
             if not self.review_items:
+                if hasattr(self, "_review_source_path"):
+                    del self._review_source_path
+                self.zoom_viewer.source_path = None
                 previous_photo = self._preview_photo
                 self.preview_label.configure(image="", text="")
                 self._preview_photo = None
                 self._defer_preview_photo_release(previous_photo)
                 self.review_details.configure(text="")
+                for label in self.excel_highlights.values(): label.configure(text="")
                 self._clear_zoom_alternatives()
                 self._suggested_zoom = None
                 self._original_suggested_zoom = None
@@ -662,6 +718,7 @@ class MainWindow:
             if selection:
                 self.review_index = selection[0]
             result = self.review_items[self.review_index]
+            self._sync_left(self._set_identity(result))
             zoom = result["zoom"]
             self._original_suggested_zoom = result.get(
                 "original_suggested_zoom",
@@ -676,6 +733,7 @@ class MainWindow:
             self._show_review_candidate(zoom)
             self.fullscreen_button.configure(state="normal")
             reviewable = result["status"] in {
+                "ZOOM_EXACT",
                 "ZOOM_PENDING_REVIEW",
                 "ZOOM_ACCEPTED",
                 "ZOOM_REJECTED",
@@ -743,6 +801,18 @@ class MainWindow:
         )
         identity = self._set_identity(result)
         set_id = self.set_id_map.get(identity, "Pendiente de asignación")
+        record = next((row for row in self._records if self._set_identity(row) == identity), {})
+        excel_data = record.get("original_data", {})
+        def excel_value(key):
+            value = excel_data.get(key)
+            return str(value).strip() if value is not None and str(value).strip() else "Sin dato en el Excel"
+        for key, title in (("elemento", "Elemento"), ("anomalia", "Anomalía"), ("criticidad", "Criticidad")):
+            self.excel_highlights[key].configure(text=f"{title}: {excel_value(key)}")
+        colors = {"baja": ("#DCFCE7", "#166534"), "media": ("#FEF3C7", "#854D0E"),
+                  "alta": ("#FFEDD5", "#9A3412"), "urgente": ("#FEE2E2", "#B91C1C")}
+        bg, fg = colors.get(excel_value("criticidad").casefold(), ("#E8F0FE", "#123E82"))
+        self.excel_highlights["criticidad"].configure(background=bg, foreground=fg)
+        self.review_details_canvas.yview_moveto(0)
         self.review_details.configure(
             text=(
                 f"SET: {set_id}\n"
@@ -758,6 +828,10 @@ class MainWindow:
                 f"Ruta: {candidate['path']}"
             )
         )
+        preview = build_sets([{**result, "zoom": candidate, "status": "ZOOM_ACCEPTED"}], self._parsed_images)[0]
+        for title, key, channel in (("Zoom", "zoom", "Z"), ("Wide", "wide", "W"), ("Thermal", "thermal", "T")):
+            self._show_set_preview(title, preview[key], channel in preview["ambiguous_channels"])
+        self.set_details.configure(text=record_details(record, result) + "\nVista actual: " + candidate["name"] + "\nAceptar confirma esta Zoom y sus pares.")
         self._load_review_preview()
         self._refresh_fullscreen_preview()
         self._update_use_zoom_state()
@@ -885,6 +959,7 @@ class MainWindow:
         ).pack(side="left")
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         self._center_dialog(dialog)
+        self._wrap_buttons(dialog)
         dialog.grab_set()
         dialog.wait_window()
 
@@ -892,12 +967,12 @@ class MainWindow:
         self,
         override_reason: str,
         override_distance_m: float | None,
-    ) -> None:
+    ) -> bool:
         if (
             self._suggested_zoom is None
             or self._viewed_zoom_candidate is None
         ):
-            return
+            return False
 
         result = self.review_items[self.review_index]
         identity = self._set_identity(result)
@@ -929,7 +1004,7 @@ class MainWindow:
         )
         try:
             self._refresh_summary()
-        except Exception:
+        except Exception as error:
             result.clear()
             result.update(previous_result)
             self.set_results = previous_sets
@@ -937,22 +1012,17 @@ class MainWindow:
             self.next_set_id = previous_next_set_id
             self._refresh_set_list()
             self._show_current_review()
-            return
+            messagebox.showerror("No se confirmó la imagen", str(error), parent=self.root)
+            return False
 
         self.output_plan = None
         self.output_plan_summary.set("")
-        self.output_is_stale = self._previous_output_exists()
-        if self.output_is_stale:
-            self.output_plan_summary.set(
-                "La salida generada anteriormente ya no corresponde al "
-                "estado actual del proyecto.\n\n"
-                "Retire o renombre la carpeta y el Excel anteriores antes "
-                "de generar nuevamente."
-            )
+        self.output_is_stale = False
         self._suggested_zoom = selected_zoom
         self._viewed_zoom_candidate = selected_zoom
         self._zoom_neighbor_items = self._zoom_neighbors(selected_zoom)
         self._refresh_review_list(preferred_identity=identity)
+        return True
 
     def _clear_zoom_alternatives(self) -> None:
         for child in self.zoom_alternatives.winfo_children():
@@ -990,7 +1060,7 @@ class MainWindow:
             for child in card.winfo_children():
                 child.configure(
                     background=background,
-                    foreground=self._theme["text"],
+                    foreground=self._time_color(child._time_seconds) if hasattr(child, "_time_seconds") else self._theme["text"],
                 )
 
     def _render_zoom_alternatives(self) -> None:
@@ -1056,10 +1126,11 @@ class MainWindow:
                 card,
                 text=f"{position}\n{seconds_text}\n{distance_text}",
                 background=background,
-                foreground=self._theme["text"],
+                foreground=self._time_color(seconds),
                 justify="center",
                 font=("Segoe UI", 8, "bold" if is_suggested else "normal"),
             )
+            caption._time_seconds = seconds
             caption.pack(fill="x", padx=2, pady=(1, 2))
             select = lambda _event, item=candidate: (
                 self._schedule_alternative_selection(item)
@@ -1095,7 +1166,7 @@ class MainWindow:
             self._alternative_click_job = None
         self.zoom_viewer.reset_view()
         self._show_review_candidate(candidate)
-        self.zoom_viewer.show_fullscreen()
+        self._open_image_popup(self._viewed_zoom_candidate)
 
     def _load_review_preview(self) -> None:
         if self._review_preview_rendering:
@@ -1207,7 +1278,7 @@ class MainWindow:
     def _open_fullscreen_review(self) -> None:
         if not self.review_items or not hasattr(self, "_review_source_path"):
             return
-        self.zoom_viewer.show_fullscreen()
+        self._open_image_popup(self._viewed_zoom_candidate)
 
     def _on_fullscreen_resize(self, _event: object = None) -> None:
         self._on_review_preview_resize()
@@ -1238,8 +1309,8 @@ class MainWindow:
         return [
             result
             for result in self.zoom_results
-            if self._set_identity(result) in active_sets
-            or id(result) in manual_items
+            if result["status"] != "EXCLUDED" and (self._set_identity(result) in active_sets
+            or id(result) in manual_items)
         ]
 
     def _refresh_review_list(
@@ -1248,7 +1319,7 @@ class MainWindow:
         select_first: bool = False,
     ) -> None:
         self.review_items = (
-            list(self.pending_reviews)
+            [r for r in self.pending_reviews if r["status"] != "EXCLUDED"]
             if self.review_mode.get() == "Revisar pendientes"
             else self._all_review_items()
         )
@@ -1290,24 +1361,22 @@ class MainWindow:
                 f"{status}",
             )
 
-        pending_count = sum(
-            result["status"] == "ZOOM_PENDING_REVIEW"
-            for result in self.pending_reviews
+        statuses = [row["status"] for row in self.zoom_results if row["status"] != "EXCLUDED"]
+        total = len(statuses)
+        automatic = statuses.count("ZOOM_EXACT")
+        manual = statuses.count("ZOOM_ACCEPTED")
+        pending = statuses.count("ZOOM_PENDING_REVIEW")
+        rejected = statuses.count("ZOOM_REJECTED")
+        unresolved = total - automatic - manual - pending - rejected
+        complete = sum(row["status"] == "SET_COMPLETE" for row in self.set_results)
+        incomplete = len(self.set_results) - complete
+        images = sum(row.get(channel) is not None for row in self.set_results for channel in ("wide", "zoom", "thermal"))
+        message = (
+            f"Total: {total} anomalías · {total * 3} imágenes esperadas\n"
+            f"Automáticas: {automatic} · Confirmadas manualmente: {manual} · Pendientes: {pending}\n"
+            f"Sin resolver: {unresolved} · Rechazadas: {rejected}\n"
+            f"Listas para exportar: {complete} SET completos + {incomplete} incompletos · {images} imágenes asociadas"
         )
-        reviewed_count = len(self.pending_reviews) - pending_count
-        if not self.pending_reviews:
-            message = "Sin revisiones de Zoom necesarias"
-        elif pending_count == 0:
-            message = (
-                "Revisión de Zoom completada\n"
-                f"Pendientes: 0\n"
-                f"Revisadas: {reviewed_count} de {len(self.pending_reviews)}"
-            )
-        else:
-            message = (
-                f"Pendientes: {pending_count}\n"
-                f"Revisadas: {reviewed_count} de {len(self.pending_reviews)}"
-            )
         self.review_progress.configure(text=message)
         if self.review_items:
             self.review_index = selected_index
@@ -1326,30 +1395,32 @@ class MainWindow:
             item["status"] == "ZOOM_PENDING_REVIEW"
             for item in self.zoom_results
         )
-        decide_zoom(result, approved)
+        # Una miniatura pendiente de renderizar no debe cambiar lo aceptado.
+        if self._alternative_click_job is not None:
+            self.root.after_cancel(self._alternative_click_job)
+            self._alternative_click_job = None
+        if approved:
+            if self._viewed_zoom_candidate is None:
+                return
+            if not self._confirm_viewed_zoom(
+                "Imagen visible confirmada con Aceptar", None
+            ):
+                return
+        else:
+            decide_zoom(result, False)
+        self.output_plan = None
+        self.output_plan_summary.set("")
         pending_after = any(
             item["status"] == "ZOOM_PENDING_REVIEW"
             for item in self.zoom_results
         )
         self._refresh_summary()
         preferred_identity = current_identity
-        if self.review_mode.get() == "Revisar pendientes":
-            pending_items_after = [
-                item
-                for item in self.pending_reviews
-                if item["status"] == "ZOOM_PENDING_REVIEW"
-            ]
-            if pending_items_after:
-                current_position = self.pending_reviews.index(result)
-                next_pending = next(
-                    (
-                        item
-                        for item in self.pending_reviews[current_position + 1 :]
-                        if item["status"] == "ZOOM_PENDING_REVIEW"
-                    ),
-                    pending_items_after[0],
-                )
-                preferred_identity = self._set_identity(next_pending)
+        position = self.zoom_results.index(result)
+        ordered = self.zoom_results[position + 1:] + self.zoom_results[:position]
+        next_pending = next((item for item in ordered if item["status"] == "ZOOM_PENDING_REVIEW"), None)
+        if next_pending is not None:
+            preferred_identity = self._set_identity(next_pending)
         self._refresh_review_list(preferred_identity=preferred_identity)
         if pending_before > 0 and not pending_after:
             messagebox.showinfo(
@@ -1383,8 +1454,8 @@ class MainWindow:
         summary_lines = [
             "Proyecto válido",
             "Excel leído correctamente",
-            f"Registros con referencia: {len(self._records)}",
-            f"Imágenes encontradas en Materiales: {len(self._images)}",
+            f"Anomalías activas: {sum(r['status'] != 'EXCLUDED' for r in self.zoom_results)} · Excluidas: {sum(r['status'] == 'EXCLUDED' for r in self.zoom_results)}",
+            f"Imágenes encontradas en el proyecto: {len(self._images)}",
             "Nombres duplicados: 0",
             f"Nombres DJI reconocidos: {self._recognized_count}",
             f"Nombres DJI no reconocidos: {len(self._unrecognized)}",
@@ -1396,7 +1467,7 @@ class MainWindow:
             f"Zoom rechazadas: {statuses.count('ZOOM_REJECTED')}",
             f"Zoom no encontradas: {statuses.count('ZOOM_NOT_FOUND')}",
             f"Zoom ambiguas: {statuses.count('ZOOM_AMBIGUOUS')}",
-            f"Referencias no interpretables: {statuses.count('INVALID_REFERENCE')}",
+            f"Fecha en A u hora en G inválida: {statuses.count('INVALID_REFERENCE')}",
             "",
             f"SET completos: {len(complete_sets)}",
             f"SET incompletos: {len(incomplete_sets)}",
@@ -1417,7 +1488,7 @@ class MainWindow:
         problem_sections = (
             ("ZOOM_NOT_FOUND", "Zoom no encontradas:"),
             ("ZOOM_AMBIGUOUS", "Zoom ambiguas:"),
-            ("INVALID_REFERENCE", "Referencias no interpretables:"),
+            ("INVALID_REFERENCE", "Fecha en A u hora en G inválida:"),
         )
         for status, heading in problem_sections:
             problems = [
@@ -1459,7 +1530,7 @@ class MainWindow:
 
     def _update_finalize_state(self) -> None:
         pending = any(
-            result["status"] == "ZOOM_PENDING_REVIEW"
+            result["status"] in {"ZOOM_PENDING_REVIEW", "INVALID_REFERENCE"}
             for result in self.zoom_results
         )
         state = "normal" if self.review_active and not pending else "disabled"
@@ -1479,24 +1550,18 @@ class MainWindow:
         self._update_finalize_state()
         if self.finalize_button.cget("state") == "disabled":
             self.output_plan_summary.set(
-                "Existen revisiones de Zoom pendientes."
+                "Existen revisiones pendientes o fechas/horas inválidas en A/G."
             )
             return
-        if self.output_is_stale:
-            if self._previous_output_exists():
-                self.output_plan_summary.set(
-                    "La salida generada anteriormente ya no corresponde al "
-                    "estado actual del proyecto.\n\n"
-                    "Retire o renombre la carpeta y el Excel anteriores antes "
-                    "de generar nuevamente."
-                )
-                return
-            self.output_is_stale = False
         self.output_plan = build_output_plan(
             self.current_root,
             self.zoom_results,
             self.set_results,
         )
+        records = {self._set_identity(row): row for row in self._records}
+        for item in self.output_plan["sets"]:
+            item["source_record"] = records[self._set_identity(item)]
+            item["anomaly_name"] = item["source_record"].get("original_data", {}).get("anomalia", "")
         summary = self.output_plan["summary"]
         lines = [
             "Plan de salida preparado",
@@ -1507,29 +1572,13 @@ class MainWindow:
             f"Imágenes faltantes: {summary['missing_images']}",
             f"Decisiones manuales: {summary['manual_decisions']}",
             f"Validaciones automáticas: {summary['automatic_validations']}",
-            f"Destino previsto: {self.output_plan['destination_name']}",
+            "Destino: carpeta raíz del proyecto (según el modo elegido)",
         ]
         if self.output_plan["reason"]:
             lines.extend(["", self.output_plan["reason"]])
-        output_folder = Path(self.output_plan["destination_folder"])
-        try:
-            output_folder.mkdir()
-        except FileExistsError:
-            folder_ready = output_folder.is_dir()
-            folder_result = (
-                "La carpeta ya existía."
-                if folder_ready
-                else "No fue posible crear la carpeta de salida."
-            )
-        except OSError:
-            folder_ready = False
-            folder_result = "No fue posible crear la carpeta de salida."
-        else:
-            folder_ready = True
-            folder_result = "Carpeta creada correctamente"
-        lines.extend(["", folder_result])
+        lines.append("Las imágenes y los dos Excel se guardarán directamente en la raíz, sin carpeta contenedora.")
         self.output_plan_summary.set("\n".join(lines))
-        if folder_ready:
+        if not self.output_plan["reason"]:
             self._show_copy_confirmation()
 
     def _show_copy_confirmation(self) -> None:
@@ -1544,11 +1593,11 @@ class MainWindow:
         content.pack(fill="both", expand=True)
         details = (
             ("Nombre del proyecto", Path(plan["root_folder"]).name),
-            ("Carpeta destino", plan["destination_folder"]),
+            ("Ubicación", str(Path(plan["root_folder"]))),
             ("Cantidad de SET completos", summary["complete_sets"]),
             ("Cantidad de SET incompletos", summary["incomplete_sets"]),
             ("Cantidad de SET descartados", summary["discarded_sets"]),
-            ("Cantidad total de imágenes que serán copiadas", summary["images_to_copy"]),
+            ("Imágenes únicas seleccionadas", summary["images_to_copy"]),
             ("Cantidad de imágenes faltantes", summary["missing_images"]),
             ("Cantidad de decisiones manuales", summary["manual_decisions"]),
             ("Cantidad de validaciones automáticas", summary["automatic_validations"]),
@@ -1561,43 +1610,24 @@ class MainWindow:
                 row=row, column=1, sticky="w", pady=4
             )
 
+        export_mode = tk.StringVar(value=UNIFIED)
+        ttk.Label(content, text="Modo de salida:").grid(row=len(details), column=0, sticky="w", pady=8)
+        ttk.Combobox(content, textvariable=export_mode, values=(UNIFIED, SEPARATED), state="readonly", width=28).grid(row=len(details), column=1, sticky="w", pady=8)
         buttons = ttk.Frame(content)
         buttons.grid(
-            row=len(details), column=0, columnspan=2, pady=(20, 0)
+            row=len(details) + 1, column=0, columnspan=2, pady=(20, 0)
         )
         ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(
             side="left", padx=(0, 8)
         )
 
         def begin_copy() -> None:
+            selected_mode = export_mode.get()
             dialog.destroy()
-            copy_summary = copy_planned_images(self.output_plan)
-            if copy_summary["source_missing"]:
-                lines = [
-                    "La copia no pudo completarse porque uno o más "
-                    "archivos planificados ya no existen en Materiales.",
-                    "Archivos fuente faltantes: "
-                    f"{copy_summary['source_missing']}",
-                ]
-                if copy_summary["copy_errors"]:
-                    lines.append(
-                        f"Errores de copia: {copy_summary['copy_errors']}"
-                    )
-                self.output_plan_summary.set("\n".join(lines))
-                return
-            if copy_summary["copy_errors"]:
-                self.output_plan_summary.set(
-                    "La copia finalizó con errores.\n"
-                    f"Errores de copia: {copy_summary['copy_errors']}\n"
-                    "No se generó el Excel de trazabilidad."
-                )
-                return
             try:
-                traceability_path = generate_traceability_excel(
-                    self.output_plan
-                )
-            except TraceabilityError as error:
-                self.output_plan_summary.set(str(error))
+                copy_summary, result_folder, traceability_path = run_task(self.root, "Exportando " + selected_mode, lambda report: export_plan(self.output_plan, selected_mode, report))
+            except Exception as error:
+                self.output_plan_summary.set(f"No se publicó el resultado: {error}")
                 return
             summary = self.output_plan["summary"]
             self.output_plan_summary.set(
@@ -1607,8 +1637,8 @@ class MainWindow:
                 f"Imágenes ya existentes: {copy_summary['images_existing']}\n"
                 f"SET completos: {summary['complete_sets']}\n"
                 f"SET incompletos: {summary['incomplete_sets']}\n\n"
-                f"Carpeta:\n{self.output_plan['destination_name']}\n\n"
-                f"Trazabilidad:\n{traceability_path.name}"
+                f"Modo: {selected_mode}\nCarpeta:\n{result_folder}\n\n"
+                f"Trazabilidad:\n{traceability_path.name}\n\nSegundo Excel:\nAnomalias.xlsx"
             )
             self._show_process_completed_dialog()
 
@@ -1619,6 +1649,7 @@ class MainWindow:
         ).pack(side="left")
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         self._center_dialog(dialog)
+        self._wrap_buttons(dialog)
         dialog.grab_set()
         dialog.wait_window()
 
@@ -1636,7 +1667,7 @@ class MainWindow:
             text=(
                 "El proyecto se procesó correctamente.\n\n"
                 "Se generaron las imágenes de salida y el archivo de "
-                "trazabilidad."
+                "trazabilidad y el segundo Excel Anomalias.xlsx."
             ),
             justify="left",
         ).pack()
@@ -1664,6 +1695,7 @@ class MainWindow:
         ).pack(side="left")
         dialog.protocol("WM_DELETE_WINDOW", lambda: None)
         self._center_dialog(dialog)
+        self._wrap_buttons(dialog)
         dialog.grab_set()
         dialog.wait_window()
 
@@ -1671,6 +1703,7 @@ class MainWindow:
         if self._alternative_click_job is not None:
             self.root.after_cancel(self._alternative_click_job)
             self._alternative_click_job = None
+        self._excluded_history = []
         self.zoom_results = []
         self.set_results = []
         self.set_id_map = {}
@@ -1709,7 +1742,7 @@ class MainWindow:
         return result["row_number"], str(result["file_reference"])
 
     def _assign_set_ids(self) -> None:
-        for result in self.set_results:
+        for result in self.zoom_results + self.set_results:
             identity = self._set_identity(result)
             if identity not in self.set_id_map:
                 self.set_id_map[identity] = f"SET-{self.next_set_id:04d}"
@@ -1727,94 +1760,84 @@ class MainWindow:
         selection = self.set_list.curselection()
         selected_index = selection[0] if selection else 0
         self.set_list.delete(0, "end")
-        for result in self.set_results:
-            visible_status = (
-                "SET completo"
-                if result["status"] == "SET_COMPLETE"
-                else "SET incompleto"
-            )
-            self.set_list.insert(
-                "end",
-                f"{result['set_id']}   Fila {result['row_number']}   "
-                f"{visible_status}   "
-                f"Sec. {result['sequence']}",
-            )
-        if not self.set_results:
+        self.anomaly_rows = describe_anomalies([row for row in self.zoom_results if row["status"] != "EXCLUDED"], getattr(self, "_parsed_images", []))
+        for row in self.anomaly_rows:
+            result = row["correlation"]
+            self.set_list.insert("end", f"{result.get('set_id', 'SET')} · {'Agregado manualmente · ' if result.get('manual_added') else ''}{row['label']} · {row['available']}/3")
+        for index, row in enumerate(self.anomaly_rows):
+            status = row["correlation"]["status"]
+            color = {"ZOOM_ACCEPTED": "#166534", "ZOOM_EXACT": "#1D4ED8", "ZOOM_PENDING_REVIEW": "#854D0E"}.get(status, "#B91C1C")
+            self.set_list.itemconfigure(index, foreground=color)
+        if not self.anomaly_rows:
             self._clear_set_details()
             return
-        selected_index = min(selected_index, len(self.set_results) - 1)
+        selected_index = min(selected_index, len(self.anomaly_rows) - 1)
         self.set_list.selection_set(selected_index)
         self.set_list.activate(selected_index)
         self._show_selected_set(selected_index)
 
-    def _on_set_selected(self, _event: object = None) -> None:
+    def _sync_left(self, identity):
+        for index, row in enumerate(self.anomaly_rows):
+            if self._set_identity(row["correlation"]) == identity:
+                self.set_list.selection_clear(0, "end")
+                self.set_list.selection_set(index)
+                self.set_list.see(index)
+                self._show_selected_set(index)
+                return
+
+    def _navigate_set(self, direction):
+        if not self.anomaly_rows: return
+        selected = self.set_list.curselection()
+        index = min(max((selected[0] if selected else 0) + direction, 0), len(self.anomaly_rows)-1)
+        self.set_list.selection_clear(0, "end")
+        self.set_list.selection_set(index)
+        self.set_list.see(index)
+        self._on_set_selected()
+
+    def _on_set_selected(self, _event=None):
         selection = self.set_list.curselection()
-        if selection:
-            self._show_selected_set(selection[0])
+        if not selection: return
+        index = selection[0]
+        self._show_selected_set(index)
+        result = self.anomaly_rows[index]["correlation"]
+        if result.get("zoom"):
+            self.review_mode.set("Ver todos los SET")
+            self._refresh_review_list(preferred_identity=self._set_identity(result))
+        else:
+            self.review_items = []
+            self.review_list.delete(0, "end")
+            self._show_current_review()
+            record = self._record_for(result)
+            details = record_details(record, result) + "\n\n" + self.anomaly_rows[index]["reason"]
+            self.preview_label.configure(text=details, wraplength=500, justify="left")
+            for key, title in (("elemento", "Elemento"), ("anomalia", "Anomalía"), ("criticidad", "Criticidad")):
+                self.excel_highlights[key].configure(text=f"{title}: {record.get('original_data', {}).get(key) or 'Sin dato'}")
+            self.review_details.configure(text=details)
 
     def _clear_set_details(self) -> None:
         self._set_preview_photos.clear()
+        self._left_images.clear()
         self.set_details.configure(text="Sin SET disponibles")
         for label in self.set_preview_labels.values():
             label.configure(image="", text="NO ENCONTRADA")
 
     def _show_selected_set(self, index: int) -> None:
-        result = self.set_results[index]
-        zoom_result = next(
-            (
-                correlation
-                for correlation in self.zoom_results
-                if correlation.get("zoom") is result["zoom"]
-                and correlation.get("row_number") == result["row_number"]
-            ),
-            None,
-        )
-        zoom_difference = (
-            zoom_result.get("time_difference") if zoom_result else None
-        )
-        visible_status = (
-            "Completo" if result["status"] == "SET_COMPLETE" else "Incompleto"
-        )
-        detail_lines = [
-            f"ID: {result['set_id']}",
-            f"Fila Excel: {result['row_number']}",
-            f"Referencia Excel: {result['file_reference']}",
-            f"Secuencia: {result['sequence']}",
-            f"Estado: {visible_status}",
-            "",
-            "ZOOM",
-            f"Nombre: {result['zoom']['name']}",
-            f"Diferencia respecto del Excel: {zoom_difference:+d} segundos",
-        ]
-        for key, label in (("wide", "WIDE"), ("thermal", "THERMAL")):
-            channel = "W" if key == "wide" else "T"
-            detail_lines.extend(["", label])
-            if channel in result["ambiguous_channels"]:
-                detail_lines.append("AMBIGUA")
-                detail_lines.extend(
-                    f"- {candidate['name']}"
-                    for candidate in result["ambiguous_channels"][channel]
-                )
-            elif result[key] is None:
-                detail_lines.append("Nombre: NO ENCONTRADA")
-            else:
-                detail_lines.extend(
-                    [
-                        f"Nombre: {result[key]['name']}",
-                        "Diferencia respecto de Zoom: "
-                        f"{result['channel_differences'][channel]:+d} segundos",
-                    ]
-                )
-        self.set_details.configure(text="\n".join(detail_lines))
-
+        row = self.anomaly_rows[index]
+        correlation = row["correlation"]
+        preview = row["preview"]
+        self.set_details.configure(text=(
+            f"{len(self.anomaly_rows)} anomalías activas · {len(self.anomaly_rows) * 3} imágenes esperadas\n"
+            f"{correlation.get('set_id', 'SET')}\n{record_details(self._record_for(correlation), correlation)}\n"
+            f"{row['label']} · {row['available']}/3 imágenes candidatas\n{row['reason']}"
+        ))
         self._set_preview_photos.clear()
-        self._show_set_preview("Zoom", result["zoom"], False)
-        self._show_set_preview(
-            "Wide", result["wide"], "W" in result["ambiguous_channels"]
-        )
-        self._show_set_preview(
-            "Thermal", result["thermal"], "T" in result["ambiguous_channels"]
-        )
+        for title, key, channel in (("Zoom", "zoom", "Z"), ("Wide", "wide", "W"), ("Thermal", "thermal", "T")):
+            if preview:
+                self._show_set_preview(title, preview[key], channel in preview["ambiguous_channels"])
+            else:
+                text = "SIN ZOOM VÁLIDA" if channel == "Z" else "SIN REFERENCIA ZOOM"
+                self._left_images[title] = None
+                self.set_preview_labels[title].configure(image="", text=text)
 
     def _show_set_preview(
         self,
@@ -1823,6 +1846,7 @@ class MainWindow:
         ambiguous: bool,
     ) -> None:
         label = self.set_preview_labels[channel]
+        self._left_images[channel] = None if ambiguous else image
         if ambiguous:
             label.configure(image="", text="AMBIGUA")
             return
@@ -1832,260 +1856,12 @@ class MainWindow:
         try:
             with Image.open(image["path"]) as source:
                 preview = ImageOps.exif_transpose(source)
-                preview.thumbnail((150, 110), Image.Resampling.LANCZOS)
+                preview.thumbnail((95, 85), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(preview)
             self._set_preview_photos[channel] = photo
             label.configure(image=photo, text="")
         except (OSError, ValueError):
             label.configure(image="", text="No se pudo previsualizar")
-
-    def _show_project_check_dialog(self, root_folder: Path) -> bool:
-        entries = list(root_folder.iterdir())
-        source_excel = next(
-            entry
-            for entry in entries
-            if entry.is_file()
-            and not entry.name.startswith("~$")
-            and not entry.name.startswith("Trazabilidad MAAT One ")
-            and entry.suffix.casefold() in {".xlsx", ".xls"}
-        )
-        traceability_names = sorted(
-            entry.name
-            for entry in entries
-            if entry.is_file()
-            and entry.name.startswith("Trazabilidad MAAT One ")
-            and entry.suffix.casefold() in {".xlsx", ".xls"}
-        )
-        anomaly_names = sorted(
-            entry.name
-            for entry in entries
-            if entry.is_dir() and entry.name.startswith("Anomalias One ")
-        )
-        expected_traceability = (
-            f"Trazabilidad MAAT One {root_folder.name}.xlsx"
-        )
-        expected_anomalies = f"Anomalias One {root_folder.name}"
-        matching_traceability = expected_traceability in traceability_names
-        matching_anomalies = expected_anomalies in anomaly_names
-        inconsistent_traceability = [
-            name for name in traceability_names if name != expected_traceability
-        ]
-        inconsistent_anomalies = [
-            name for name in anomaly_names if name != expected_anomalies
-        ]
-        has_outputs = bool(traceability_names or anomaly_names)
-        has_inconsistencies = bool(
-            inconsistent_traceability or inconsistent_anomalies
-        )
-
-        matching_lines: list[str] = []
-        if matching_traceability:
-            matching_lines.append(
-                f"Trazabilidad coincidente: {expected_traceability}"
-            )
-        if matching_anomalies:
-            matching_lines.append(
-                f"Carpeta coincidente: {expected_anomalies}"
-            )
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Comprobación del proyecto")
-        dialog.transient(self.root)
-        dialog.resizable(False, False)
-        dialog.configure(background=self._theme["background"])
-        content = ttk.Frame(dialog, padding=24)
-        content.pack(fill="both", expand=True)
-        semantic_colors = (
-            {
-                "normal": "#4ADE80",
-                "warning": "#FBBF24",
-                "error": "#FB7185",
-                "error_background": "#3A242A",
-            }
-            if self.dark_mode
-            else {
-                "normal": "#15803D",
-                "warning": "#B45309",
-                "error": "#C2410C",
-                "error_background": "#FFF1F2",
-            }
-        )
-        style = ttk.Style(self.root)
-        state = (
-            "normal"
-            if not has_outputs
-            else "error" if has_inconsistencies else "warning"
-        )
-        style.configure(
-            "ProjectCheck.Heading.TLabel",
-            background=self._theme["panel"],
-            foreground=semantic_colors[state],
-            font=("Segoe UI", 14, "bold"),
-        )
-        heading = {
-            "normal": "PROYECTO LISTO PARA PROCESAR",
-            "warning": "LÍNEA PROCESADA ANTERIORMENTE",
-            "error": "INCONSISTENCIA DETECTADA",
-        }[state]
-        ttk.Label(
-            content,
-            text=heading,
-            style="ProjectCheck.Heading.TLabel",
-        ).pack(anchor="w")
-        ttk.Label(
-            content,
-            text=root_folder.name,
-            font=("Segoe UI", 12, "bold"),
-        ).pack(anchor="w", pady=(6, 16))
-
-        if state == "normal":
-            ttk.Label(
-                content,
-                text=f"Excel:\n{source_excel.name}",
-                justify="left",
-            ).pack(anchor="w")
-            ttk.Label(
-                content,
-                text="Todo listo para comenzar.",
-                foreground=semantic_colors["normal"],
-                font=("Segoe UI", 10, "bold"),
-            ).pack(anchor="w", pady=(16, 0))
-        elif state == "warning":
-            existing_lines = [f"✓ Excel para procesar:\n{source_excel.name}"]
-            if matching_traceability:
-                existing_lines.append(
-                    f"✓ Trazabilidad:\n{expected_traceability}"
-                )
-            if matching_anomalies:
-                existing_lines.append(
-                    f"✓ Carpeta de anomalías:\n{expected_anomalies}"
-                )
-            ttk.Label(
-                content,
-                text="\n\n".join(existing_lines),
-                justify="left",
-                wraplength=650,
-            ).pack(anchor="w")
-            ttk.Label(
-                content,
-                text=(
-                    "Las salidas encontradas corresponden con esta línea."
-                ),
-                foreground=semantic_colors["warning"],
-                font=("Segoe UI", 10, "bold"),
-            ).pack(anchor="w", pady=(16, 8))
-            ttk.Label(
-                content,
-                text=(
-                    "Puede continuar para volver a procesarla.\n"
-                    "Se mantendrán las protecciones existentes sobre "
-                    "archivos ya generados."
-                ),
-                justify="left",
-                wraplength=650,
-            ).pack(anchor="w")
-        else:
-            for name in inconsistent_traceability:
-                block = tk.Frame(
-                    content,
-                    background=semantic_colors["error_background"],
-                    highlightbackground=semantic_colors["error"],
-                    highlightthickness=1,
-                )
-                block.pack(fill="x", pady=(0, 10))
-                tk.Label(
-                    block,
-                    text=(
-                        "TRAZABILIDAD ENCONTRADA\n"
-                        f"{name}\n\n"
-                        "TRAZABILIDAD ESPERADA\n"
-                        f"{expected_traceability}\n\n"
-                        "⚠ Los nombres no coinciden."
-                    ),
-                    background=semantic_colors["error_background"],
-                    foreground=semantic_colors["error"],
-                    justify="left",
-                    anchor="w",
-                    padx=12,
-                    pady=10,
-                    font=("Segoe UI", 9, "bold"),
-                ).pack(fill="x")
-            for name in inconsistent_anomalies:
-                block = tk.Frame(
-                    content,
-                    background=semantic_colors["error_background"],
-                    highlightbackground=semantic_colors["error"],
-                    highlightthickness=1,
-                )
-                block.pack(fill="x", pady=(0, 10))
-                tk.Label(
-                    block,
-                    text=(
-                        "CARPETA ENCONTRADA\n"
-                        f"{name}\n\n"
-                        "CARPETA ESPERADA\n"
-                        f"{expected_anomalies}\n\n"
-                        "⚠ Los nombres no coinciden."
-                    ),
-                    background=semantic_colors["error_background"],
-                    foreground=semantic_colors["error"],
-                    justify="left",
-                    anchor="w",
-                    padx=12,
-                    pady=10,
-                    font=("Segoe UI", 9, "bold"),
-                ).pack(fill="x")
-            if matching_lines:
-                ttk.Label(
-                    content,
-                    text=(
-                        "Coincidencias encontradas:\n"
-                        + "\n".join(f"✓ {line}" for line in matching_lines)
-                    ),
-                    justify="left",
-                    wraplength=650,
-                ).pack(anchor="w", pady=(4, 12))
-            ttk.Label(
-                content,
-                text="Revise las inconsistencias antes de continuar.",
-                foreground=semantic_colors["error"],
-                font=("Segoe UI", 10, "bold"),
-            ).pack(anchor="w", pady=(4, 8))
-            ttk.Label(
-                content,
-                text=(
-                    "Puede continuar para procesar, pero MAAT One mantendrá "
-                    "todas las protecciones existentes sobre las salidas "
-                    "anteriores."
-                ),
-                justify="left",
-                wraplength=650,
-            ).pack(anchor="w")
-
-        decision = False
-
-        def continue_processing() -> None:
-            nonlocal decision
-            decision = True
-            dialog.destroy()
-
-        buttons = ttk.Frame(content)
-        buttons.pack(pady=(20, 0))
-        ttk.Button(
-            buttons,
-            text="Continuar para procesar",
-            command=continue_processing,
-        ).pack(side="left", padx=(0, 8))
-        ttk.Button(
-            buttons,
-            text="Cancelar",
-            command=dialog.destroy,
-        ).pack(side="left")
-        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-        self._center_dialog(dialog)
-        dialog.grab_set()
-        dialog.wait_window()
-        return decision
 
     def _select_root_folder(self) -> None:
         selected = filedialog.askdirectory(
@@ -2093,40 +1869,41 @@ class MainWindow:
             title="Seleccionar carpeta raíz",
         )
         if selected:
+            self._excluded_history = []
             self.finalize_button.configure(state="disabled")
             self.output_plan = None
             self.output_plan_summary.set("")
             self.zoom_results = []
+            self.set_results = []
+            self._refresh_set_list()
             self.pending_reviews = []
             self.review_index = 0
             self.review_active = False
             self._refresh_review_list()
             root_folder = Path(selected)
-            validation_result = validate_root_folder(root_folder)
+            validation_result = run_task(self.root, "Verificando carpeta", lambda report: validate_root_folder(root_folder))
             if not validation_result.startswith("Proyecto válido"):
                 self.status.set(validation_result)
                 return
 
             self.output_is_stale = False
-            if not self._show_project_check_dialog(root_folder):
-                return
             self._prepare_set_ids_for_root(root_folder)
 
             try:
-                records = read_project_excel(root_folder)
+                records = run_task(self.root, "Leyendo Excel", lambda report: read_project_excel(root_folder))
             except Exception:
                 self.status.set(
                     "Proyecto no válido\n"
-                    "No se pudo leer el archivo Excel."
+                    "No se pudo leer el Excel o no contiene registros bajo sus encabezados."
                 )
                 return
 
             try:
-                images, duplicates = inventory_project_images(root_folder)
+                images, duplicates = run_task(self.root, "Buscando imágenes", lambda report: inventory_project_images(root_folder))
             except Exception:
                 self.status.set(
                     "Proyecto detenido\n"
-                    "No se pudo leer la carpeta Materiales."
+                    "No se pudieron leer las imágenes de la carpeta seleccionada."
                 )
                 return
 
@@ -2144,7 +1921,7 @@ class MainWindow:
                 self.status.set("\n".join(duplicate_lines))
                 return
 
-            parsed_images = parse_dji_images(images)
+            parsed_images = run_task(self.root, "Interpretando imágenes", lambda report: parse_dji_images(images))
             recognized_count = sum(
                 image["recognized"] for image in parsed_images
             )
@@ -2156,7 +1933,7 @@ class MainWindow:
             self._recognized_count = recognized_count
             self._unrecognized = unrecognized
             self._parsed_images = parsed_images
-            self.zoom_results = match_zoom_images(records, parsed_images)
+            self.zoom_results = run_task(self.root, "Asociando anomalías con imágenes", lambda report: match_zoom_images(records, parsed_images))
             self.pending_reviews = [
                 result
                 for result in self.zoom_results
@@ -2166,6 +1943,194 @@ class MainWindow:
             self.review_active = True
             self._refresh_summary()
             self._refresh_review_list()
+
+    @staticmethod
+    def _time_color(seconds):
+        return "#15803D" if abs(seconds) <= 5 else "#C06000" if abs(seconds) <= 10 else "#DC2626"
+
+    def _wrap_buttons(self, parent):
+        style = ttk.Style(self.root)
+        style.configure("Busy.TButton", background="#FBBF24", foreground="#172033")
+        style.map("Busy.TButton", background=[("disabled", "#FBBF24")], foreground=[("disabled", "#172033")])
+        for widget in parent.winfo_children():
+            if isinstance(widget, ttk.Button) and widget.cget("command"):
+                command = widget.cget("command")
+                def invoke(w=widget, cmd=command):
+                    if getattr(w, "_busy_wrapped_running", False): return
+                    w._busy_wrapped_running = True
+                    old_text, old_style = w.cget("text"), w.cget("style")
+                    w.configure(text="Procesando…", style="Busy.TButton", state="disabled")
+                    self.root.update_idletasks()
+                    def execute():
+                        try: self.root.tk.call(cmd)
+                        finally:
+                            try:
+                                exists = bool(w.winfo_exists())
+                            except tk.TclError:
+                                exists = False
+                            if exists:
+                                w.configure(text=old_text, style=old_style, state="normal")
+                                w._busy_wrapped_running = False
+                                self._update_finalize_state()
+                                self._update_use_zoom_state()
+                                if w in (self.accept_button, self.reject_button) and not self.review_items:
+                                    w.configure(state="disabled")
+                    self.root.after(30, execute)
+                widget.configure(command=invoke)
+            self._wrap_buttons_children(widget)
+
+    def _wrap_buttons_children(self, widget):
+        if widget.winfo_children(): self._wrap_buttons(widget)
+
+    def _open_image_popup(self, image):
+        if not image: return
+        try:
+            with Image.open(image["path"]) as file:
+                source = ImageOps.exif_transpose(file).copy()
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Imagen no disponible", str(error), parent=self.root)
+            return
+        popup = tk.Toplevel(self.root)
+        popup.title(image["name"] + " · Rueda: zoom · Arrastrar: mover · Doble clic / Esc: cerrar")
+        popup.state("zoomed")
+        canvas = tk.Canvas(popup, background="#111827", highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        view = {"zoom": 1.0, "x": 0, "y": 0, "drag": None}
+        def render(event=None):
+            width, height = max(1,canvas.winfo_width()), max(1,canvas.winfo_height())
+            scale = min(width/source.width, height/source.height)*view["zoom"]
+            # Recortar antes de ampliar evita crear bitmaps enormes al hacer zoom.
+            left = width/2 + view["x"] - source.width*scale/2
+            top = height/2 + view["y"] - source.height*scale/2
+            photo = source.transform((width,height), Image.Transform.AFFINE,
+                (1/scale,0,-left/scale,0,1/scale,-top/scale), Image.Resampling.BICUBIC)
+            canvas._photo = ImageTk.PhotoImage(photo)
+            canvas.delete("all");canvas.create_image(0,0,anchor="nw",image=canvas._photo)
+        def wheel(event):
+            old=view["zoom"]
+            view["zoom"]=min(16,max(1,old*(1.2 if event.delta>0 else 1/1.2)))
+            ratio=view["zoom"]/old
+            view["x"]=(event.x-canvas.winfo_width()/2)*(1-ratio)+view["x"]*ratio
+            view["y"]=(event.y-canvas.winfo_height()/2)*(1-ratio)+view["y"]*ratio
+            if view["zoom"]==1: view["x"]=view["y"]=0
+            render()
+        def drag(event):
+            if view["drag"]:
+                x,y=view["drag"];view["x"]+=event.x-x;view["y"]+=event.y-y
+                view["drag"]=(event.x,event.y);render()
+        canvas.bind("<Configure>",render)
+        canvas.bind("<MouseWheel>",wheel)
+        canvas.bind("<ButtonPress-1>",lambda e:view.update(drag=(e.x,e.y)))
+        canvas.bind("<B1-Motion>",drag)
+        canvas.bind("<ButtonRelease-1>",lambda e:view.update(drag=None))
+        canvas.bind("<Double-Button-1>",lambda e:popup.destroy())
+        popup.bind("<Escape>",lambda e:popup.destroy())
+        popup.focus_set()
+
+    def _exclude_set(self):
+        selection=self.set_list.curselection()
+        if not selection: return
+        result=self.anomaly_rows[selection[0]]["correlation"]
+        self._excluded_history.append((result, result["status"]))
+        result["status"]="EXCLUDED"
+        self.output_plan=None; self.output_plan_summary.set("")
+        self._refresh_summary(); self._refresh_review_list()
+        if self.anomaly_rows: self._on_set_selected()
+
+    def _undo_exclude(self):
+        if not self._excluded_history: return
+        result,status=self._excluded_history.pop();result["status"]=status
+        self._refresh_summary()
+        self._sync_left(self._set_identity(result));self._on_set_selected()
+        self.output_plan=None;self.output_plan_summary.set("")
+
+    def _record_for(self, result):
+        return next((row for row in self._records if self._set_identity(row) == self._set_identity(result)), {})
+
+    def _pick_project_zoom(self):
+        if not self.review_active:
+            messagebox.showinfo("Cargar proyecto", "Seleccione primero una carpeta raíz válida.", parent=self.root)
+            return None
+        selected = filedialog.askopenfilename(parent=self.root, title="Seleccionar imagen Zoom (_Z.JPG)", initialdir=str(self.current_root), filetypes=[("Imagen JPG", "*.jpg *.JPG")])
+        if not selected:
+            return None
+        path = Path(selected).resolve()
+        image = next((item for item in self._parsed_images if Path(item["path"]).resolve() == path), None)
+        if not image or not image.get("recognized") or image.get("channel") != "Z" or not path.is_file():
+            messagebox.showerror("Zoom no válida", "Seleccione una Zoom DJI del proyecto cargado. Si acaba de agregar archivos a la carpeta, vuelva a cargarla antes de iniciar la revisión.", parent=self.root)
+            return None
+        return image
+
+    def _manual_changed(self, result):
+        self.zoom_results.sort(key=lambda row: (row.get("normalized_date") or "99999999", row.get("target_time") or "999999"))
+        self.pending_reviews = [row for row in self.zoom_results if row.get("zoom") and row["status"] != "ZOOM_EXACT"]
+        self.output_plan = None
+        self.output_plan_summary.set("")
+        self._refresh_summary()
+        self.review_mode.set("Ver todos los SET")
+        self._refresh_review_list(preferred_identity=self._set_identity(result))
+
+    def _link_manual_zoom(self):
+        selection = self.set_list.curselection()
+        if not selection:
+            messagebox.showinfo("Seleccionar SET", "Seleccione primero el registro de la lista izquierda.", parent=self.root)
+            return
+        result = self.anomaly_rows[selection[0]]["correlation"]
+        image = self._pick_project_zoom()
+        if image is None:
+            return
+        try:
+            link_zoom(result, image)
+        except ValueError as error:
+            messagebox.showerror("Referencia inválida", str(error), parent=self.root)
+            return
+        self._manual_changed(result)
+
+    def _add_manual_set(self):
+        image = self._pick_project_zoom()
+        if image is None:
+            return
+        if any(row.get("zoom", {}).get("path") == image["path"] for row in self.zoom_results):
+            messagebox.showinfo("SET existente", "Esta Zoom ya está vinculada a un registro. Selecciónelo en la lista para revisarlo.", parent=self.root)
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Agregar SET manual")
+        dialog.transient(self.root)
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=image["name"]).grid(row=0, columnspan=2, pady=8)
+        values = {}
+        for index, (key, title) in enumerate((("element", "Elemento"), ("anomaly", "Anomalía"), ("criticality", "Criticidad"), ("line", "Línea"), ("stage", "Etapa")), 1):
+            ttk.Label(body, text=title).grid(row=index, column=0, sticky="w", padx=8, pady=5)
+            values[key] = tk.StringVar()
+            if key == "criticality":
+                field = ttk.Combobox(body, textvariable=values[key], values=("Baja", "Media", "Alta", "Urgente"), state="readonly")
+            else:
+                field = ttk.Entry(body, textvariable=values[key], width=44)
+            field.grid(row=index, column=1, sticky="ew")
+        def add():
+            data = {key: value.get().strip() for key, value in values.items()}
+            if not all(data.values()):
+                messagebox.showerror("Datos incompletos", "Complete los cinco campos para identificar la anomalía.", parent=dialog)
+                return
+            number = 1 + sum(bool(row.get("manual_added")) for row in self._records)
+            record = manual_record(image, data, number)
+            result = match_zoom_images([record], [image])[0]
+            result["manual_added"] = True
+            link_zoom(result, image)
+            self._records.append(record)
+            self.zoom_results.append(result)
+            dialog.destroy()
+            self._manual_changed(result)
+        ttk.Button(body, text="Agregar y revisar", command=add).grid(row=6, column=1, pady=12)
+        ttk.Button(body, text="Cancelar", command=dialog.destroy).grid(row=6, column=0)
+        self._center_dialog(dialog)
+        self._wrap_buttons(dialog)
+        dialog.grab_set()
+
+    def _open_coordinate_search(self) -> None:
+        """Abre el flujo GPS autónomo sin modificar el proyecto en curso."""
+        CoordinateSearchWindow(self.root)
 
     def run(self) -> None:
         self.root.mainloop()

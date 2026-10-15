@@ -69,13 +69,18 @@ def _observations(record: dict[str, object]) -> str:
         != record["final_used_filename"]
     )
     messages = {
+        "EXCLUDED": "SET excluido por el usuario; no se exportan sus imágenes ni su fila de anomalías.",
         "ZOOM_EXACT": "Zoom exacta validada automáticamente.",
         "ZOOM_REJECTED": "Zoom rechazada manualmente.",
         "ZOOM_NOT_FOUND": "Zoom no encontrada dentro de ±5 s.",
         "ZOOM_AMBIGUOUS": "Zoom ambigua.",
-        "INVALID_REFERENCE": "Referencia Excel no interpretable.",
+        "INVALID_REFERENCE": "Fecha en A u hora HHMMSS en G no válida.",
     }
     parts: list[str] = []
+    if record.get("manual_added"):
+        parts.append("Agregado manualmente; no existe fila en el Excel original.")
+    if record.get("override_reason") and not zoom_replaced:
+        parts.append(str(record["override_reason"]))
     if status == "ZOOM_ACCEPTED" and not zoom_replaced:
         parts.append(
             "Zoom aceptada manualmente con "
@@ -152,7 +157,7 @@ def _incident_row(record: dict[str, object]) -> tuple[object, ...] | None:
     )
     if status in {
         "ZOOM_REJECTED", "ZOOM_NOT_FOUND", "ZOOM_AMBIGUOUS",
-        "INVALID_REFERENCE",
+        "INVALID_REFERENCE", "EXCLUDED",
     }:
         kinds.append(status)
         details.append(_observations(record))
@@ -300,7 +305,7 @@ def _build_incidents(workbook: Workbook, plan: dict[str, object]) -> None:
         sheet.column_dimensions[chr(64 + index)].width = width
 
 
-def generate_traceability_excel(plan: dict[str, object] | None) -> Path:
+def generate_traceability_excel(plan: dict[str, object] | None, output_path: Path | None = None) -> Path:
     """Valida el plan y guarda un libro nuevo sin sobrescribir otro."""
     if plan is None:
         raise TraceabilityError("No existe un plan de salida.")
@@ -316,16 +321,27 @@ def generate_traceability_excel(plan: dict[str, object] | None) -> Path:
         raise TraceabilityError("No existe la carpeta de copia.")
 
     root_folder = Path(plan["root_folder"])
-    output_path = root_folder / f"Trazabilidad MAAT One {root_folder.name}.xlsx"
+    if output_path is None:
+        output_path = root_folder / f"Trazabilidad MAAT One {root_folder.name}.xlsx"
     if output_path.exists():
         raise TraceabilityError(
             "Ya existe el Excel de trazabilidad de MAAT One."
         )
 
     workbook = Workbook()
+    if plan.get("output_identifier"):
+        workbook.properties.identifier = plan["output_identifier"]
     _build_summary(workbook, plan)
     _build_traceability(workbook, plan)
     _build_incidents(workbook, plan)
+    if plan.get("export_folders"):
+        sheet = workbook.create_sheet("CARPETAS")
+        sheet.append(["Modo", plan["export_mode"]])
+        sheet.append(["SET", "Anomalía", "Carpeta relativa"])
+        for entry in plan["export_folders"]: sheet.append(list(entry))
+        sheet.column_dimensions["A"].width = 25
+        sheet.column_dimensions["B"].width = 50
+        sheet.column_dimensions["C"].width = 70
     try:
         workbook.save(output_path)
     except OSError as error:
